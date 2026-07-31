@@ -13,6 +13,9 @@
  */
 package org.lance.spark.update;
 
+import org.lance.spark.LanceSparkReadOptions;
+import org.lance.spark.utils.Utils;
+
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -133,7 +136,7 @@ public abstract class BaseShowIndexesTest {
   }
 
   @Test
-  public void testShowIndexesFiltersSystemIndexes() {
+  public void testShowIndexesFiltersMemWalIndex() {
     spark.sql(
         String.format(
             "create table %s (id int, region string) using lance "
@@ -157,5 +160,30 @@ public abstract class BaseShowIndexesTest {
     Assertions.assertEquals("btree", row.getString(2));
     Assertions.assertTrue(row.getLong(3) >= 1L);
     Assertions.assertTrue(row.getLong(4) >= 1L);
+  }
+
+  @Test
+  public void testShowIndexesFiltersFragmentReuseIndex() {
+    prepareDataset();
+    spark.sql(String.format("alter table %s create index test_index using btree (id)", fullTable));
+    spark.sql(
+        String.format(
+            "optimize %s with (target_rows_per_fragment=20000, defer_index_remap=true)",
+            fullTable));
+
+    try (var dataset =
+        Utils.openDatasetBuilder(LanceSparkReadOptions.builder().datasetUri(tableDir).build())
+            .build()) {
+      Assertions.assertTrue(
+          dataset.getIndexes().stream()
+              .anyMatch(index -> "__lance_frag_reuse".equalsIgnoreCase(index.name())),
+          "OPTIMIZE with deferred index remapping must create a fragment-reuse system index");
+    }
+
+    List<Row> rows = spark.sql(String.format("show indexes from %s", fullTable)).collectAsList();
+
+    Assertions.assertEquals(1, rows.size());
+    Assertions.assertEquals("test_index", rows.get(0).getString(0));
+    Assertions.assertEquals("btree", rows.get(0).getString(2));
   }
 }
