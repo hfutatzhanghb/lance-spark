@@ -13,6 +13,10 @@
  */
 package org.lance.spark.update;
 
+import org.lance.index.IndexOptions;
+import org.lance.index.IndexParams;
+import org.lance.index.IndexType;
+import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.utils.Utils;
 
@@ -165,7 +169,22 @@ public abstract class BaseShowIndexesTest {
   @Test
   public void testShowIndexesFiltersFragmentReuseIndex() {
     prepareDataset();
-    spark.sql(String.format("alter table %s create index test_index using btree (id)", fullTable));
+
+    // Use one index segment over all fragments so compaction rewrites indexed data. Distributed
+    // CREATE INDEX produces per-task segments that the compaction planner keeps in separate bins.
+    IndexParams indexParams =
+        IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("BTREE")).build();
+    try (var dataset =
+        Utils.openDatasetBuilder(LanceSparkReadOptions.builder().datasetUri(tableDir).build())
+            .build()) {
+      dataset.createIndex(
+          IndexOptions.builder(List.of("id"), IndexType.BTREE, indexParams)
+              .replace(true)
+              .train(true)
+              .withIndexName("test_index")
+              .build());
+    }
+
     spark.sql(
         String.format(
             "optimize %s with (target_rows_per_fragment=20000, defer_index_remap=true)",
