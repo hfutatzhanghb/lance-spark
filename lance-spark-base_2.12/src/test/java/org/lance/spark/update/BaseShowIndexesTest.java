@@ -131,4 +131,32 @@ public abstract class BaseShowIndexesTest {
     long numIndexedRows = row.getLong(4);
     Assertions.assertTrue(numIndexedRows >= 1L, "num_indexed_rows should be at least 1");
   }
+
+  @Test
+  public void testShowIndexesFiltersSystemIndexes() {
+    spark.sql(
+        String.format(
+            "create table %s (id int, region string) using lance "
+                + "partitioned by (bucket(4, region))",
+            fullTable));
+    spark.sql(
+        String.format(
+            "insert into %s values (1, 'east'), (2, 'west'), (3, 'north'), (4, 'south')",
+            fullTable));
+
+    List<Row> systemOnly =
+        spark.sql(String.format("show indexes from %s", fullTable)).collectAsList();
+    Assertions.assertTrue(systemOnly.isEmpty(), "MemWAL must not appear in SHOW INDEXES");
+
+    spark.sql(String.format("alter table %s create index test_index using btree (id)", fullTable));
+    List<Row> rows =
+        spark.sql(String.format("show indexes from %s", fullTable)).collectAsList();
+
+    Assertions.assertEquals(1, rows.size());
+    Row row = rows.get(0);
+    Assertions.assertEquals("test_index", row.getString(0));
+    Assertions.assertEquals("btree", row.getString(2));
+    Assertions.assertTrue(row.getLong(3) >= 1L);
+    Assertions.assertTrue(row.getLong(4) >= 1L);
+  }
 }
