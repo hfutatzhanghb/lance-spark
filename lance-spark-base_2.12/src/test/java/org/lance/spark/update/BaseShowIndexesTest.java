@@ -149,8 +149,7 @@ public abstract class BaseShowIndexesTest {
     Assertions.assertTrue(systemOnly.isEmpty(), "MemWAL must not appear in SHOW INDEXES");
 
     spark.sql(String.format("alter table %s create index test_index using btree (id)", fullTable));
-    List<Row> rows =
-        spark.sql(String.format("show indexes from %s", fullTable)).collectAsList();
+    List<Row> rows = spark.sql(String.format("show indexes from %s", fullTable)).collectAsList();
 
     Assertions.assertEquals(1, rows.size());
     Row row = rows.get(0);
