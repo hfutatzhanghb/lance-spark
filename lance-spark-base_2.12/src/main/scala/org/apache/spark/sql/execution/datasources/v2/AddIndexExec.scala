@@ -54,8 +54,8 @@ import scala.collection.JavaConverters._
  *   metadata, and commits an index-creation transaction.
  * <li><b>ZONEMAP</b>: builds uncommitted index segments in parallel across fragment batches
  *   and commits the logical index on the driver.
- * <li><b>BITMAP</b>: processes each fragment independently in parallel, merges index
- *   metadata, and commits an index-creation transaction. Suitable for low-cardinality columns.
+ * <li><b>BITMAP</b>: builds uncommitted per-fragment index segments in parallel and
+ *   commits them as a single logical index on the driver. Suitable for low-cardinality columns.
  * </ul>
  *
  * <p><b>Deferred training ({@code WITH (train=false)})</b>: commits an empty index on the driver

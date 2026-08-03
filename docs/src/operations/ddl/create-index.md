@@ -63,10 +63,7 @@ For the `btree` method, the following options are supported:
 
 ### Bitmap Options
 
-For the `bitmap` method, the following options are supported:
-
-| Option           | Type   | Description                                                                                                                                                                                                         |
-|------------------|--------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+The `bitmap` method has no method-specific options; only the common `train` option applies.
 
 Bitmap indexes do not require any special configuration parameters. They create a bitmap for each distinct value, making them efficient for equality filters on columns with a limited set of distinct values (up to a few thousand unique values).
 
@@ -234,7 +231,7 @@ Consider creating an index when:
 
 The `CREATE INDEX` command operates as follows:
 
-1.  **Index Build Execution**: Lance Spark chooses an execution path based on the index method. Methods such as `btree`, `fts`, and `zonemap` can build physical index segments in parallel across fragments. `zonemap` publishes those segments directly as one logical index. Range-mode `btree` uses Spark repartitioning and sorted preprocessed data.
+1.  **Index Build Execution**: Lance Spark chooses an execution path based on the index method. Methods such as `btree`, `bitmap`, `fts`, and `zonemap` can build physical index segments in parallel across fragments. `bitmap` and `zonemap` publish those segments directly as one logical index. Range-mode `btree` uses Spark repartitioning and sorted preprocessed data.
 2.  **Metadata Finalization**: Lance Spark merges or commits the resulting index metadata on the driver so the new logical index becomes visible atomically.
 3.  **Transactional Commit**: A new table version is committed with the new index information. The operation is atomic and ensures that concurrent reads are not affected.
 
