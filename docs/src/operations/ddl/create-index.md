@@ -24,10 +24,10 @@ The following index methods are supported:
 
 | Method  | Description                                                                 |
 |---------|-----------------------------------------------------------------------------|
-| `btree` | B-tree index for efficient range queries and point lookups on scalar columns. |
-| `bitmap` | Bitmap index for efficient point queries on low-cardinality columns.        |
-| `fts`   | Full-text search (inverted) index for text search on string columns.        |
 | `zonemap` | Lightweight min/max index for fragment pruning on a scalar column. |
+| `btree` | B-tree index for efficient range queries and point lookups on scalar columns. |
+| `fts`   | Full-text search (inverted) index for text search on string columns.        |
+| `bitmap` | Bitmap index for efficient point queries on low-cardinality columns.        |
 
 ## Options
 
