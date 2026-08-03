@@ -24,9 +24,10 @@ The following index methods are supported:
 
 | Method  | Description                                                                 |
 |---------|-----------------------------------------------------------------------------|
-| `zonemap` | Lightweight min/max index for fragment pruning on a scalar column. |
 | `btree` | B-tree index for efficient range queries and point lookups on scalar columns. |
+| `bitmap` | Bitmap index for efficient point queries on low-cardinality columns.        |
 | `fts`   | Full-text search (inverted) index for text search on string columns.        |
+| `zonemap` | Lightweight min/max index for fragment pruning on a scalar column. |
 
 ## Options
 
@@ -59,6 +60,15 @@ For the `btree` method, the following options are supported:
 | `build_mode`     | String | Index building mode: 'fragment' builds indexes in parallel by fragment; 'range' sorts data by indexed columns first, then partitions and builds indexes in parallel by partition. Default is 'fragment'. |
 | `rows_per_range` | Long   | The number of rows per range when built using range mode. Default is 1000000.                                                                                                                            |
 
+
+### Bitmap Options
+
+For the `bitmap` method, the following options are supported:
+
+| Option           | Type   | Description                                                                                                                                                                                                         |
+|------------------|--------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+
+Bitmap indexes do not require any special configuration parameters. They create a bitmap for each distinct value, making them efficient for equality filters on columns with a limited set of distinct values (up to a few thousand unique values).
 
 ### FTS Options
 
@@ -120,6 +130,15 @@ Create a zonemap index when you want lightweight min/max-based fragment pruning:
 === "SQL"
     ```sql
     ALTER TABLE lance.db.users CREATE INDEX idx_id_zonemap USING zonemap (id);
+    ```
+
+### Bitmap Index on Low-Cardinality Column
+
+Create a bitmap index on a status column for fast equality lookups:
+
+=== "SQL"
+    ```sql
+    ALTER TABLE lance.db.users CREATE INDEX idx_status_bitmap USING bitmap (status);
     ```
 
 ### Indexing with Options
@@ -189,7 +208,7 @@ to scanning the data until it is populated. There are two ways to populate it:
     dataset.optimizeIndices(OptimizeOptions.builder().build());
     ```
 
-`train = false` is supported for all index methods (`btree`, `fts`, `zonemap`). Because a deferred
+`train = false` is supported for all index methods (`btree`, `fts`, `zonemap`, `bitmap`). Because a deferred
 index performs no segmented build at creation time, `num_segments` cannot be combined with
 `train = false` — pass it on the eager build that populates the index instead.
 
@@ -209,6 +228,7 @@ Consider creating an index when:
 - You frequently filter a large table on a specific column.
 - You want lightweight fragment pruning based on per-zone min/max statistics.
 - Your queries involve point lookups or small range scans.
+- You need fast equality lookups on low-cardinality columns (bitmap indexes).
 
 ## How It Works
 
@@ -220,7 +240,7 @@ The `CREATE INDEX` command operates as follows:
 
 ## Notes and Limitations
 
-- **Index Methods**: The `zonemap`, `btree`, and `fts` methods are supported for scalar index creation.
+- **Index Methods**: The `zonemap`, `btree`, `bitmap`, and `fts` methods are supported for scalar index creation.
 - **Zonemap Column Count**: Zonemap indexes currently support a single column only. The generic `CREATE INDEX` grammar accepts a column list, but Lance rejects multi-column zonemap creation.
 - **Index Replacement**: If you create an index with the same name as an existing one, the old index will be replaced by the new one.
 - **Deferred Training**: With `train = false` the index is registered empty and is populated later, either by re-running `CREATE INDEX` (a full distributed build that replaces the empty index) or, for incremental coverage of newly appended fragments, by `Dataset.optimizeIndices` in the SDK. The SQL `OPTIMIZE` command compacts fragments and does not train deferred indexes.

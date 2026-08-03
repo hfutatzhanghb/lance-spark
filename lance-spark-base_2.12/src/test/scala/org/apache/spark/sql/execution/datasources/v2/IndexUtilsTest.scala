@@ -179,4 +179,16 @@ class IndexUtilsTest {
       classOf[UnsupportedOperationException],
       () => IndexUtils.buildIndexType("ivf_pq"))
   }
+
+  @Test
+  def buildIndexType_bitmapCaseInsensitive(): Unit = {
+    import org.lance.index.IndexType
+    assertEquals(IndexType.BITMAP, IndexUtils.buildIndexType("bitmap"))
+    assertEquals(IndexType.BITMAP, IndexUtils.buildIndexType("BITMAP"))
+  }
+
+  @Test
+  def buildScalarIndexParamType_bitmapReturnsBitmap(): Unit = {
+    assertEquals("bitmap", IndexUtils.buildScalarIndexParamType("bitmap"))
+  }
 }

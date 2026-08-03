@@ -54,6 +54,8 @@ import scala.collection.JavaConverters._
  *   metadata, and commits an index-creation transaction.
  * <li><b>ZONEMAP</b>: builds uncommitted index segments in parallel across fragment batches
  *   and commits the logical index on the driver.
+ * <li><b>BITMAP</b>: processes each fragment independently in parallel, merges index
+ *   metadata, and commits an index-creation transaction. Suitable for low-cardinality columns.
  * </ul>
  *
  * <p><b>Deferred training ({@code WITH (train=false)})</b>: commits an empty index on the driver
@@ -190,7 +192,7 @@ case class AddIndexExec(
     // Both fragment mode (Lance sorts each fragment) and range mode (Spark
     // pre-sorts each fragment's data) produce segments with disjoint fragment
     // coverage, so they can be committed as a single logical index directly.
-    if (indexType == IndexType.BTREE) {
+    if (indexType == IndexType.BTREE || indexType == IndexType.BITMAP) {
       val segments: Seq[Index] =
         if (btreeBuildMode.contains("range")) {
           new RangeBasedBTreeIndexJob(
@@ -209,7 +211,8 @@ case class AddIndexExec(
             nsImpl,
             nsProps,
             tableId,
-            initialStorageOpts).run()
+            initialStorageOpts,
+            indexType = indexType).run()
         }
       commitIndexSegments(readOptions, canonicalColumns.head, segments)
       return Seq(new GenericInternalRow(Array[Any](
@@ -552,7 +555,8 @@ class BTreeFragmentIndexJob(
     nsImpl: Option[String],
     nsProps: Option[Map[String, String]],
     tableId: Option[List[String]],
-    initialStorageOpts: Option[Map[String, String]]) extends Serializable {
+    initialStorageOpts: Option[Map[String, String]],
+    indexType: IndexType = IndexType.BTREE) extends Serializable {
 
   def run(): Seq[Index] = {
     val encodedReadOptions = encode(readOptions)
@@ -569,7 +573,8 @@ class BTreeFragmentIndexJob(
         nsImpl,
         nsProps,
         tableId,
-        initialStorageOpts)
+        initialStorageOpts,
+        indexType = indexType)
     }
 
     addIndexExec.session.sparkContext
@@ -603,7 +608,8 @@ case class BTreeFragmentSegmentTask(
     namespaceImpl: Option[String],
     namespaceProperties: Option[Map[String, String]],
     tableId: Option[List[String]],
-    initialStorageOptions: Option[Map[String, String]]) extends Serializable {
+    initialStorageOptions: Option[Map[String, String]],
+    indexType: IndexType = IndexType.BTREE) extends Serializable {
 
   def execute(): String = {
     val readOptions = decode[LanceSparkReadOptions](encodedReadOptions)
@@ -616,7 +622,7 @@ case class BTreeFragmentSegmentTask(
     // No index name or UUID: Lance generates the segment UUID, and the logical
     // index name is assigned when the segments are committed on the driver.
     val indexOptions = IndexOptions
-      .builder(java.util.Arrays.asList(columns: _*), IndexType.BTREE, params)
+      .builder(java.util.Arrays.asList(columns: _*), indexType, params)
       .replace(false)
       .withFragmentIds(Collections.singletonList(fragmentId))
       .build()
@@ -993,6 +999,7 @@ object IndexUtils {
       case "btree" => IndexType.BTREE
       case "zonemap" => IndexType.ZONEMAP
       case "fts" => IndexType.INVERTED
+      case "bitmap" => IndexType.BITMAP
       case other => throw new UnsupportedOperationException(s"Unsupported index method: $other")
     }
   }
@@ -1002,6 +1009,7 @@ object IndexUtils {
       case "btree" => "btree"
       case "zonemap" => "zonemap"
       case "fts" => "inverted"
+      case "bitmap" => "bitmap"
       case other => throw new UnsupportedOperationException(s"Unsupported index method: $other")
     }
   }

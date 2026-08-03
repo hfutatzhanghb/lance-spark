@@ -1138,6 +1138,46 @@ public abstract class BaseAddIndexTest {
     }
   }
 
+  @Test
+  public void testCreateBitmapIndex() {
+    prepareDataset();
+
+    Dataset<Row> result =
+        spark.sql(
+            String.format(
+                "alter table %s create index test_bitmap_idx using bitmap (id)", fullTable));
+
+    Assertions.assertEquals(
+        "StructType(StructField(fragments_indexed,LongType,true),StructField(index_name,StringType,true))",
+        result.schema().toString());
+
+    Row row = result.collectAsList().get(0);
+    long fragmentsIndexed = row.getLong(0);
+    String indexName = row.getString(1);
+
+    Assertions.assertTrue(fragmentsIndexed >= 2, "Expected at least 2 fragments to be indexed");
+    Assertions.assertEquals("test_bitmap_idx", indexName);
+
+    // Check index is created successfully
+    checkIndex("test_bitmap_idx");
+
+    // Verify query using the indexed field
+    Dataset<Row> query = spark.sql(String.format("select * from %s where id=5", fullTable));
+    Assertions.assertEquals(1L, query.count());
+    Row r = query.collectAsList().get(0);
+    Assertions.assertEquals(5, r.getInt(0));
+    Assertions.assertEquals("text_5", r.getString(1));
+  }
+
+  @Test
+  public void testBitmapIndexHasIndexDetails() {
+    prepareDataset();
+    spark.sql(
+        String.format(
+            "alter table %s create index idx_details_bitmap using bitmap (id)", fullTable));
+    verifyIndexDetails("idx_details_bitmap", "BITMAP");
+  }
+
   private Index checkIndex(String indexName) {
     // Check index is created successfully
     org.lance.Dataset lanceDataset = org.lance.Dataset.open().uri(tableDir).build();
