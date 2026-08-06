@@ -18,6 +18,11 @@ import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Test
 import org.lance.index.IndexType
 
+import java.lang.{Long => JLong}
+import java.util.Optional
+
+import scala.collection.mutable.ArrayBuffer
+
 /**
  * Unit tests for [[IndexUtils]] helper methods.
  *
@@ -221,5 +226,52 @@ class IndexUtilsTest {
     assertEquals(ids, batches.flatten)
     assertEquals(ids.size, batches.flatten.distinct.size)
     assertTrue(batches.forall(_.nonEmpty))
+  }
+
+  @Test
+  def indexBuildProgress_accumulatesStageProgressDeltas(): Unit = {
+    var completed = 0L
+    var total = 0L
+    val logs = ArrayBuffer.empty[String]
+    val progress = new SparkIndexBuildProgress(
+      "idx_text",
+      delta => completed += delta,
+      delta => total += delta,
+      message => logs += message)
+
+    progress.stageStart(
+      "read_partition_metadata",
+      Optional.of(JLong.valueOf(5L)),
+      "partitions")
+    progress.stageProgress("read_partition_metadata", 2L)
+    progress.stageProgress("read_partition_metadata", 4L)
+    progress.stageProgress("read_partition_metadata", 3L)
+    progress.stageComplete("read_partition_metadata")
+
+    assertEquals(5L, total)
+    assertEquals(
+      5L,
+      completed,
+      "stageProgress reports absolute completed work; Spark metrics must add only deltas")
+    assertTrue(logs.head.contains("started"))
+    assertTrue(logs.last.contains("completed"))
+  }
+
+  @Test
+  def indexBuildProgress_recordsUnknownTotalStages(): Unit = {
+    var completed = 0L
+    var total = 0L
+    val progress = new SparkIndexBuildProgress(
+      "idx_text",
+      delta => completed += delta,
+      delta => total += delta,
+      _ => ())
+
+    progress.stageStart("write_merged_metadata", Optional.empty(), "files")
+    progress.stageProgress("write_merged_metadata", 7L)
+    progress.stageComplete("write_merged_metadata")
+
+    assertEquals(0L, total)
+    assertEquals(7L, completed)
   }
 }

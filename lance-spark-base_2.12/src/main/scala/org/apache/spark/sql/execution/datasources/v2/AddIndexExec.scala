@@ -23,12 +23,13 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, GenericInternalRow}
 import org.apache.spark.sql.catalyst.plans.logical.{AddIndexOutputType, LanceNamedArgument}
 import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog}
+import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.LanceArrowUtils
 import org.apache.spark.sql.util.LanceSerializeUtil.{decode, encode}
 import org.apache.spark.unsafe.types.UTF8String
 import org.lance.{CommitBuilder, Dataset, Transaction}
-import org.lance.index.{Index, IndexOptions, IndexParams, IndexType}
+import org.lance.index.{Index, IndexBuildProgress, IndexOptions, IndexParams, IndexType}
 import org.lance.index.scalar.{BTreeIndexParams, ScalarIndexParams}
 import org.lance.operation.{CreateIndex => AddIndexOperation}
 import org.lance.spark.{BaseLanceNamespaceSparkCatalog, LanceDataset, LanceRuntime, LanceSparkReadOptions}
@@ -36,8 +37,12 @@ import org.lance.spark.arrow.LanceArrowWriter
 import org.lance.spark.utils.{CloseableUtil, FieldPathUtils, Utils}
 import org.lance.spark.write.SingleBatchArrowReader
 
+import java.lang.{Long => JLong}
 import java.time.Instant
 import java.util.{Collections, Locale, Optional, UUID}
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import java.util.function.BiFunction
 
 import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
@@ -79,6 +84,12 @@ case class AddIndexExec(
     args: Seq[LanceNamedArgument]) extends LeafV2CommandExec {
 
   override def output: Seq[Attribute] = AddIndexOutputType.SCHEMA
+
+  override lazy val metrics: Map[String, SQLMetric] = Map(
+    "indexMergeCompletedUnits" ->
+      SQLMetrics.createMetric(sparkContext, "index merge completed work units"),
+    "indexMergeTotalUnits" ->
+      SQLMetrics.createMetric(sparkContext, "index merge total work units"))
 
   override protected def run(): Seq[InternalRow] = {
     val lanceDataset = catalog.loadTable(ident) match {
@@ -238,8 +249,12 @@ case class AddIndexExec(
           tableId,
           initialStorageOpts).run()
 
-      // Merge index metadata after all fragments are indexed
-      dataset.mergeIndexMetadata(uuid.toString, indexType, Optional.empty())
+      // Merge index metadata after all fragments are indexed.
+      dataset.mergeIndexMetadata(
+        uuid.toString,
+        indexType,
+        Optional.empty(),
+        createIndexMergeProgress())
 
       val fieldIds = canonicalColumns.map { column =>
         FieldPathUtils.resolveLeafField(dataset.getLanceSchema, column).getId
@@ -289,6 +304,13 @@ case class AddIndexExec(
       fragmentIds.size.toLong,
       UTF8String.fromString(indexName))))
   }
+
+  private def createIndexMergeProgress(): IndexBuildProgress =
+    new SparkIndexBuildProgress(
+      indexName,
+      completedDelta => metrics("indexMergeCompletedUnits").add(completedDelta),
+      totalDelta => metrics("indexMergeTotalUnits").add(totalDelta),
+      message => logInfo(message))
 
   /** Commits an empty (untrained) index on the driver, with an empty fragment bitmap. */
   private def commitEmptyIndex(
@@ -353,6 +375,89 @@ case class AddIndexExec(
     }
   }
 
+}
+
+private[datasources] case class IndexProgressStage(
+    completed: Long,
+    total: Option[Long],
+    unit: String)
+
+private[datasources] class SparkIndexBuildProgress(
+    indexName: String,
+    addCompletedDelta: Long => Unit,
+    addTotalDelta: Long => Unit,
+    logStatus: String => Unit) extends IndexBuildProgress {
+
+  private val stages = new ConcurrentHashMap[String, IndexProgressStage]()
+
+  override def stageStart(stage: String, total: Optional[JLong], unit: String): Unit = {
+    val totalOpt = if (total.isPresent) Some(total.get().longValue()) else None
+    val normalizedUnit = Option(unit).filter(_.nonEmpty).getOrElse("units")
+    val newTotal = totalOpt.getOrElse(0L)
+    val previous = stages.put(stage, IndexProgressStage(0L, totalOpt, normalizedUnit))
+    val previousTotal = Option(previous).flatMap(_.total).getOrElse(0L)
+    addDelta(addTotalDelta, newTotal - previousTotal)
+
+    val totalDescription = totalOpt.map(total => s"/$total").getOrElse("")
+    logStatus(
+      s"Index '$indexName' merge stage '$stage' started (0$totalDescription $normalizedUnit)")
+  }
+
+  override def stageProgress(stage: String, completed: Long): Unit = {
+    val completedDelta = new AtomicLong(0L)
+    stages.compute(
+      stage,
+      new BiFunction[String, IndexProgressStage, IndexProgressStage] {
+        override def apply(
+            ignored: String,
+            previous: IndexProgressStage): IndexProgressStage = {
+          val previousStage =
+            Option(previous).getOrElse(IndexProgressStage(0L, None, "units"))
+          val nextCompleted = Math.max(previousStage.completed, completed)
+          completedDelta.set(nextCompleted - previousStage.completed)
+          previousStage.copy(completed = nextCompleted)
+        }
+      })
+    addDelta(addCompletedDelta, completedDelta.get())
+  }
+
+  override def stageComplete(stage: String): Unit = {
+    val completedDelta = new AtomicLong(0L)
+    val completedDescription = new AtomicLong(0L)
+    stages.compute(
+      stage,
+      new BiFunction[String, IndexProgressStage, IndexProgressStage] {
+        override def apply(
+            ignored: String,
+            previous: IndexProgressStage): IndexProgressStage = {
+          val previousStage =
+            Option(previous).getOrElse(IndexProgressStage(0L, None, "units"))
+          val nextCompleted = previousStage.total
+            .map(total => Math.max(total, previousStage.completed))
+            .getOrElse(previousStage.completed)
+          completedDelta.set(nextCompleted - previousStage.completed)
+          completedDescription.set(nextCompleted)
+          previousStage.copy(completed = nextCompleted)
+        }
+      })
+    addDelta(addCompletedDelta, completedDelta.get())
+
+    val stageState = stages.get(stage)
+    val totalDescription = Option(stageState)
+      .flatMap(_.total)
+      .map(total => s"/$total")
+      .getOrElse("")
+    val unit = Option(stageState).map(_.unit).getOrElse("units")
+    logStatus(
+      s"Index '$indexName' merge stage '$stage' completed " +
+        s"(${completedDescription.get()}$totalDescription $unit)")
+  }
+
+  private def addDelta(add: Long => Unit, delta: Long): Unit = {
+    if (delta != 0L) {
+      add(delta)
+    }
+  }
 }
 
 /**

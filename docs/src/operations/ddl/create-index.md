@@ -286,6 +286,10 @@ The `CREATE INDEX` command returns the following information about the operation
 | `fragments_indexed` | Long   | The number of fragments that were indexed. |
 | `index_name`        | String | The name of the created index.         |
 
+For FTS indexes, Lance Spark also reports driver-side metadata merge progress through Spark SQL
+metrics (`index merge completed work units` and `index merge total work units`) and driver logs
+while the command is running. This progress is informational and does not change the command output.
+
 ## When to Use an Index
 
 Consider creating an index when:
