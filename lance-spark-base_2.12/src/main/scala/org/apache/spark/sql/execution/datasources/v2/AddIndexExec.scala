@@ -86,9 +86,9 @@ case class AddIndexExec(
   override def output: Seq[Attribute] = AddIndexOutputType.SCHEMA
 
   override lazy val metrics: Map[String, SQLMetric] = Map(
-    "indexMergeCompletedUnits" ->
+    AddIndexExec.INDEX_MERGE_COMPLETED_UNITS ->
       SQLMetrics.createMetric(sparkContext, "index merge completed work units"),
-    "indexMergeTotalUnits" ->
+    AddIndexExec.INDEX_MERGE_TOTAL_UNITS ->
       SQLMetrics.createMetric(sparkContext, "index merge total work units"))
 
   override protected def run(): Seq[InternalRow] = {
@@ -308,8 +308,8 @@ case class AddIndexExec(
   private def createIndexMergeProgress(): IndexBuildProgress =
     new SparkIndexBuildProgress(
       indexName,
-      completedDelta => metrics("indexMergeCompletedUnits").add(completedDelta),
-      totalDelta => metrics("indexMergeTotalUnits").add(totalDelta),
+      completedDelta => metrics(AddIndexExec.INDEX_MERGE_COMPLETED_UNITS).add(completedDelta),
+      totalDelta => metrics(AddIndexExec.INDEX_MERGE_TOTAL_UNITS).add(totalDelta),
       message => logInfo(message))
 
   /** Commits an empty (untrained) index on the driver, with an empty fragment bitmap. */
@@ -375,6 +375,11 @@ case class AddIndexExec(
     }
   }
 
+}
+
+private[datasources] object AddIndexExec {
+  private[datasources] val INDEX_MERGE_COMPLETED_UNITS = "indexMergeCompletedUnits"
+  private[datasources] val INDEX_MERGE_TOTAL_UNITS = "indexMergeTotalUnits"
 }
 
 private[datasources] case class IndexProgressStage(
