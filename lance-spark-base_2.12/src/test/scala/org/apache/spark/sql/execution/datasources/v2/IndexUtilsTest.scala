@@ -16,6 +16,7 @@ package org.apache.spark.sql.execution.datasources.v2
 import org.apache.spark.sql.catalyst.plans.logical.LanceNamedArgument
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.function.Executable
 import org.lance.index.IndexType
 
 import java.lang.{Long => JLong}
@@ -290,13 +291,18 @@ class IndexUtilsTest {
         throw new RuntimeException("warn failed")
       })
 
-    assertDoesNotThrow(() =>
+    assertProgressDoesNotThrow {
       progress.stageStart(
         "read_partition_metadata",
         Optional.of(JLong.valueOf(5L)),
-        "partitions"))
-    assertDoesNotThrow(() => progress.stageProgress("read_partition_metadata", 3L))
-    assertDoesNotThrow(() => progress.stageComplete("read_partition_metadata"))
+        "partitions")
+    }
+    assertProgressDoesNotThrow {
+      progress.stageProgress("read_partition_metadata", 3L)
+    }
+    assertProgressDoesNotThrow {
+      progress.stageComplete("read_partition_metadata")
+    }
     assertTrue(warnings >= 3)
   }
 
@@ -310,5 +316,11 @@ class IndexUtilsTest {
     assertTrue(AddIndexExec.indexMergeMetricDefinitions("BTREE").isEmpty)
     assertTrue(AddIndexExec.indexMergeMetricDefinitions("zonemap").isEmpty)
     assertTrue(AddIndexExec.indexMergeMetricDefinitions("ivf_pq").isEmpty)
+  }
+
+  private def assertProgressDoesNotThrow(callback: => Unit): Unit = {
+    assertDoesNotThrow(new Executable {
+      override def execute(): Unit = callback
+    })
   }
 }
