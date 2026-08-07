@@ -237,7 +237,8 @@ class IndexUtilsTest {
       "idx_text",
       delta => completed += delta,
       delta => total += delta,
-      message => logs += message)
+      message => logs += message,
+      (_, _) => ())
 
     progress.stageStart(
       "read_partition_metadata",
@@ -265,7 +266,8 @@ class IndexUtilsTest {
       "idx_text",
       delta => completed += delta,
       delta => total += delta,
-      _ => ())
+      _ => (),
+      (_, _) => ())
 
     progress.stageStart("write_merged_metadata", Optional.empty(), "files")
     progress.stageProgress("write_merged_metadata", 7L)
@@ -273,5 +275,40 @@ class IndexUtilsTest {
 
     assertEquals(0L, total)
     assertEquals(7L, completed)
+  }
+
+  @Test
+  def indexBuildProgress_ignoresObservationFailures(): Unit = {
+    var warnings = 0
+    val progress = new SparkIndexBuildProgress(
+      "idx_text",
+      _ => throw new RuntimeException("metric update failed"),
+      _ => throw new RuntimeException("metric update failed"),
+      _ => throw new RuntimeException("log failed"),
+      (_, _) => {
+        warnings += 1
+        throw new RuntimeException("warn failed")
+      })
+
+    assertDoesNotThrow(() =>
+      progress.stageStart(
+        "read_partition_metadata",
+        Optional.of(JLong.valueOf(5L)),
+        "partitions"))
+    assertDoesNotThrow(() => progress.stageProgress("read_partition_metadata", 3L))
+    assertDoesNotThrow(() => progress.stageComplete("read_partition_metadata"))
+    assertTrue(warnings >= 3)
+  }
+
+  @Test
+  def indexMergeMetricDefinitions_onlyReportsForFts(): Unit = {
+    val ftsMetricNames = AddIndexExec.indexMergeMetricDefinitions("fts").map(_._1).toSet
+
+    assertEquals(
+      Set(AddIndexExec.INDEX_MERGE_COMPLETED_UNITS, AddIndexExec.INDEX_MERGE_TOTAL_UNITS),
+      ftsMetricNames)
+    assertTrue(AddIndexExec.indexMergeMetricDefinitions("BTREE").isEmpty)
+    assertTrue(AddIndexExec.indexMergeMetricDefinitions("zonemap").isEmpty)
+    assertTrue(AddIndexExec.indexMergeMetricDefinitions("ivf_pq").isEmpty)
   }
 }

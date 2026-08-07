@@ -46,6 +46,7 @@ import java.util.function.BiFunction
 
 import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
+import scala.util.control.NonFatal
 
 /**
  * Physical execution of distributed CREATE INDEX (ALTER TABLE ... CREATE INDEX ...) for Lance datasets.
@@ -85,11 +86,10 @@ case class AddIndexExec(
 
   override def output: Seq[Attribute] = AddIndexOutputType.SCHEMA
 
-  override lazy val metrics: Map[String, SQLMetric] = Map(
-    AddIndexExec.INDEX_MERGE_COMPLETED_UNITS ->
-      SQLMetrics.createMetric(sparkContext, "index merge completed work units"),
-    AddIndexExec.INDEX_MERGE_TOTAL_UNITS ->
-      SQLMetrics.createMetric(sparkContext, "index merge total work units"))
+  override lazy val metrics: Map[String, SQLMetric] =
+    AddIndexExec.indexMergeMetricDefinitions(method).map { case (name, description) =>
+      name -> SQLMetrics.createMetric(sparkContext, description)
+    }.toMap
 
   override protected def run(): Seq[InternalRow] = {
     val lanceDataset = catalog.loadTable(ident) match {
@@ -310,7 +310,8 @@ case class AddIndexExec(
       indexName,
       completedDelta => metrics(AddIndexExec.INDEX_MERGE_COMPLETED_UNITS).add(completedDelta),
       totalDelta => metrics(AddIndexExec.INDEX_MERGE_TOTAL_UNITS).add(totalDelta),
-      message => logInfo(message))
+      message => logInfo(message),
+      (message, cause) => logWarning(message, cause))
 
   /** Commits an empty (untrained) index on the driver, with an empty fragment bitmap. */
   private def commitEmptyIndex(
@@ -380,6 +381,22 @@ case class AddIndexExec(
 private[datasources] object AddIndexExec {
   private[datasources] val INDEX_MERGE_COMPLETED_UNITS = "indexMergeCompletedUnits"
   private[datasources] val INDEX_MERGE_TOTAL_UNITS = "indexMergeTotalUnits"
+
+  private[datasources] def indexMergeMetricDefinitions(method: String): Map[String, String] = {
+    val indexType =
+      try {
+        Some(IndexUtils.buildIndexType(method))
+      } catch {
+        case NonFatal(_) => None
+      }
+    if (indexType.contains(IndexType.INVERTED)) {
+      Map(
+        INDEX_MERGE_COMPLETED_UNITS -> "index merge completed work units",
+        INDEX_MERGE_TOTAL_UNITS -> "index merge total work units")
+    } else {
+      Map.empty
+    }
+  }
 }
 
 private[datasources] case class IndexProgressStage(
@@ -391,24 +408,38 @@ private[datasources] class SparkIndexBuildProgress(
     indexName: String,
     addCompletedDelta: Long => Unit,
     addTotalDelta: Long => Unit,
-    logStatus: String => Unit) extends IndexBuildProgress {
+    logStatus: String => Unit,
+    logWarningStatus: (String, Throwable) => Unit) extends IndexBuildProgress {
 
   private val stages = new ConcurrentHashMap[String, IndexProgressStage]()
 
-  override def stageStart(stage: String, total: Optional[JLong], unit: String): Unit = {
+  override def stageStart(stage: String, total: Optional[JLong], unit: String): Unit =
+    observe("handle index merge progress stage start") {
+      doStageStart(stage, total, unit)
+    }
+
+  private def doStageStart(stage: String, total: Optional[JLong], unit: String): Unit = {
     val totalOpt = if (total.isPresent) Some(total.get().longValue()) else None
     val normalizedUnit = Option(unit).filter(_.nonEmpty).getOrElse("units")
     val newTotal = totalOpt.getOrElse(0L)
     val previous = stages.put(stage, IndexProgressStage(0L, totalOpt, normalizedUnit))
     val previousTotal = Option(previous).flatMap(_.total).getOrElse(0L)
-    addDelta(addTotalDelta, newTotal - previousTotal)
+    addDelta(
+      addTotalDelta,
+      "update index merge total progress metric",
+      newTotal - previousTotal)
 
     val totalDescription = totalOpt.map(total => s"/$total").getOrElse("")
-    logStatus(
+    logProgress(
       s"Index '$indexName' merge stage '$stage' started (0$totalDescription $normalizedUnit)")
   }
 
-  override def stageProgress(stage: String, completed: Long): Unit = {
+  override def stageProgress(stage: String, completed: Long): Unit =
+    observe("handle index merge progress update") {
+      doStageProgress(stage, completed)
+    }
+
+  private def doStageProgress(stage: String, completed: Long): Unit = {
     val completedDelta = new AtomicLong(0L)
     stages.compute(
       stage,
@@ -423,10 +454,18 @@ private[datasources] class SparkIndexBuildProgress(
           previousStage.copy(completed = nextCompleted)
         }
       })
-    addDelta(addCompletedDelta, completedDelta.get())
+    addDelta(
+      addCompletedDelta,
+      "update index merge completed progress metric",
+      completedDelta.get())
   }
 
-  override def stageComplete(stage: String): Unit = {
+  override def stageComplete(stage: String): Unit =
+    observe("handle index merge progress stage completion") {
+      doStageComplete(stage)
+    }
+
+  private def doStageComplete(stage: String): Unit = {
     val completedDelta = new AtomicLong(0L)
     val completedDescription = new AtomicLong(0L)
     stages.compute(
@@ -445,7 +484,10 @@ private[datasources] class SparkIndexBuildProgress(
           previousStage.copy(completed = nextCompleted)
         }
       })
-    addDelta(addCompletedDelta, completedDelta.get())
+    addDelta(
+      addCompletedDelta,
+      "update index merge completed progress metric",
+      completedDelta.get())
 
     val stageState = stages.get(stage)
     val totalDescription = Option(stageState)
@@ -453,14 +495,39 @@ private[datasources] class SparkIndexBuildProgress(
       .map(total => s"/$total")
       .getOrElse("")
     val unit = Option(stageState).map(_.unit).getOrElse("units")
-    logStatus(
+    logProgress(
       s"Index '$indexName' merge stage '$stage' completed " +
         s"(${completedDescription.get()}$totalDescription $unit)")
   }
 
-  private def addDelta(add: Long => Unit, delta: Long): Unit = {
+  private def addDelta(add: Long => Unit, action: String, delta: Long): Unit = {
     if (delta != 0L) {
-      add(delta)
+      observe(action) {
+        add(delta)
+      }
+    }
+  }
+
+  private def logProgress(message: String): Unit = {
+    observe("log index merge progress") {
+      logStatus(message)
+    }
+  }
+
+  private def observe(action: String)(callback: => Unit): Unit = {
+    try {
+      callback
+    } catch {
+      case NonFatal(e) =>
+        warn(s"Ignoring failure to $action for index '$indexName'", e)
+    }
+  }
+
+  private def warn(message: String, cause: Throwable): Unit = {
+    try {
+      logWarningStatus(message, cause)
+    } catch {
+      case NonFatal(_) =>
     }
   }
 }
