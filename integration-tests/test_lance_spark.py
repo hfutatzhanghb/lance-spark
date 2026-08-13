@@ -2258,6 +2258,66 @@ class TestDMLMerge:
 class TestDMLAddColumn:
     """Test DML ADD COLUMN FROM operations for schema evolution with backfill."""
 
+    def test_add_blob_v2_binary_column(self, spark):
+        """Test adding a BINARY column with blob v2 encoding."""
+        spark.sql("""
+            CREATE TABLE default.test_table (
+                id INT,
+                name STRING
+            )
+            TBLPROPERTIES (
+                'content.lance.encoding' = 'blob',
+                'invalid_content.lance.encoding' = 'blob',
+                'file_format_version' = '2.2'
+            )
+        """)
+
+        spark.sql("""
+            INSERT INTO default.test_table VALUES
+            (1, 'alpha'),
+            (2, 'bravo')
+        """)
+
+        spark.sql("""
+            CREATE TEMPORARY VIEW tmp_view AS
+            SELECT _rowaddr, _fragid, CAST(name AS BINARY) AS content
+            FROM default.test_table
+        """)
+
+        spark.sql("""
+            ALTER TABLE default.test_table ADD COLUMNS content FROM tmp_view
+        """)
+
+        content_field = next(
+            row
+            for row in spark.sql("DESCRIBE default.test_table").collect()
+            if row.col_name == "content"
+        )
+        assert "struct" in content_field.data_type.lower()
+
+        rows = spark.sql("""
+            SELECT id, content.size, content.kind
+            FROM default.test_table
+            ORDER BY id
+        """).collect()
+
+        assert [(row.id, row.size, row.kind) for row in rows] == [
+            (1, len(b"alpha"), 0),
+            (2, len(b"bravo"), 0),
+        ]
+
+        spark.sql("""
+            CREATE OR REPLACE TEMPORARY VIEW tmp_view AS
+            SELECT _rowaddr, _fragid, name AS invalid_content
+            FROM default.test_table
+        """)
+
+        with pytest.raises(Exception, match="must have BINARY type"):
+            spark.sql("""
+                ALTER TABLE default.test_table
+                ADD COLUMNS invalid_content FROM tmp_view
+            """)
+
     def test_add_column_from_view(self, spark):
         """Test ALTER TABLE ADD COLUMNS FROM with single column."""
         spark.sql("""

@@ -27,6 +27,36 @@ ALTER TABLE users ADD COLUMNS name_hash FROM tmp_view;
 
 No table rewrite, no data movement—just a new column that is instantly queryable.
 
+## Adding a Blob v2 Column
+
+To add a blob v2 column, declare the future `BINARY` column's blob encoding when creating the
+target table and use Lance file format version `2.2` or higher. The column property may refer to a
+column that will be added later.
+
+```sql
+CREATE TABLE users (
+    id INT,
+    name STRING
+) USING lance
+TBLPROPERTIES (
+    'content.lance.encoding' = 'blob',
+    'file_format_version' = '2.2'
+);
+
+CREATE TEMPORARY VIEW content_backfill AS
+SELECT _rowaddr, _fragid, CAST(name AS BINARY) AS content
+FROM users;
+
+ALTER TABLE users ADD COLUMNS content FROM content_backfill;
+```
+
+The source column must have Spark type `BINARY`. After the operation, reads expose `content` as a
+blob v2 descriptor struct, so descriptor fields can be queried without loading the bytes:
+
+```sql
+SELECT id, content.size, content.kind FROM users;
+```
+
 !!! note
     Because we use `_rowaddr` and `_fragid` to address the target dataset's rows for the new column's data, 
     the temporary view should contain `_rowaddr` and `_fragid`.
