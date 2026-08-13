@@ -29,9 +29,9 @@ No table rewrite, no data movement—just a new column that is instantly queryab
 
 ## Adding a Blob v2 Column
 
-To add a blob v2 column, declare the future `BINARY` column's blob encoding when creating the
-target table and use Lance file format version `2.2` or higher. The column property may refer to a
-column that will be added later.
+To add a blob v2 column, create the target table with Lance file format version `2.2` or higher,
+then persist the future `BINARY` column's blob encoding with `ALTER TABLE SET TBLPROPERTIES` before
+adding the column.
 
 ```sql
 CREATE TABLE users (
@@ -39,9 +39,11 @@ CREATE TABLE users (
     name STRING
 ) USING lance
 TBLPROPERTIES (
-    'content.lance.encoding' = 'blob',
     'file_format_version' = '2.2'
 );
+
+ALTER TABLE users
+SET TBLPROPERTIES ('content.lance.encoding' = 'blob');
 
 CREATE TEMPORARY VIEW content_backfill AS
 SELECT _rowaddr, _fragid, CAST(name AS BINARY) AS content

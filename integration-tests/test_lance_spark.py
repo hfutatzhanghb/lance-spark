@@ -2266,9 +2266,15 @@ class TestDMLAddColumn:
                 name STRING
             )
             TBLPROPERTIES (
-                'content.lance.encoding' = 'blob',
-                'invalid_content.lance.encoding' = 'blob',
                 'file_format_version' = '2.2'
+            )
+        """)
+
+        spark.sql("""
+            ALTER TABLE default.test_table
+            SET TBLPROPERTIES (
+                'content.lance.encoding' = 'blob',
+                'invalid_content.lance.encoding' = 'blob'
             )
         """)
 
@@ -2317,6 +2323,9 @@ class TestDMLAddColumn:
                 ALTER TABLE default.test_table
                 ADD COLUMNS invalid_content FROM tmp_view
             """)
+
+        field_names = [field.name for field in spark.table("default.test_table").schema.fields]
+        assert "invalid_content" not in field_names
 
     def test_add_column_from_view(self, spark):
         """Test ALTER TABLE ADD COLUMNS FROM with single column."""
