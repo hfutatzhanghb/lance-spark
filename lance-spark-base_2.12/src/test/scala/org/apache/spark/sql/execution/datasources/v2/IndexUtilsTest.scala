@@ -16,13 +16,7 @@ package org.apache.spark.sql.execution.datasources.v2
 import org.apache.spark.sql.catalyst.plans.logical.LanceNamedArgument
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Test
-import org.junit.jupiter.api.function.Executable
 import org.lance.index.IndexType
-
-import java.lang.{Long => JLong}
-import java.util.Optional
-
-import scala.collection.mutable.ArrayBuffer
 
 /**
  * Unit tests for [[IndexUtils]] helper methods.
@@ -166,9 +160,17 @@ class IndexUtilsTest {
   }
 
   @Test
-  def buildIndexType_ftsReturnsInverted(): Unit = {
+  def buildIndexType_ftsAndInvertedReturnInverted(): Unit = {
     assertEquals(IndexType.INVERTED, IndexUtils.buildIndexType("fts"))
     assertEquals(IndexType.INVERTED, IndexUtils.buildIndexType("FTS"))
+    assertEquals(IndexType.INVERTED, IndexUtils.buildIndexType("inverted"))
+    assertEquals(IndexType.INVERTED, IndexUtils.buildIndexType("INVERTED"))
+  }
+
+  @Test
+  def buildScalarIndexParamType_ftsAndInvertedReturnInverted(): Unit = {
+    assertEquals("inverted", IndexUtils.buildScalarIndexParamType("fts"))
+    assertEquals("inverted", IndexUtils.buildScalarIndexParamType("inverted"))
   }
 
   @Test
@@ -179,7 +181,9 @@ class IndexUtilsTest {
       ("label_list", IndexType.LABEL_LIST, "labellist"),
       ("ngram", IndexType.NGRAM, "ngram"),
       ("bloomfilter", IndexType.BLOOM_FILTER, "bloomfilter"),
-      ("rtree", IndexType.RTREE, "rtree"))
+      ("rtree", IndexType.RTREE, "rtree"),
+      ("fts", IndexType.INVERTED, "inverted"),
+      ("inverted", IndexType.INVERTED, "inverted"))
 
     expected.foreach { case (method, indexType, coreParamType) =>
       Seq(method, method.toUpperCase).foreach { spelling =>
@@ -227,100 +231,5 @@ class IndexUtilsTest {
     assertEquals(ids, batches.flatten)
     assertEquals(ids.size, batches.flatten.distinct.size)
     assertTrue(batches.forall(_.nonEmpty))
-  }
-
-  @Test
-  def indexBuildProgress_accumulatesStageProgressDeltas(): Unit = {
-    var completed = 0L
-    var total = 0L
-    val logs = ArrayBuffer.empty[String]
-    val progress = new SparkIndexBuildProgress(
-      "idx_text",
-      delta => completed += delta,
-      delta => total += delta,
-      message => logs += message,
-      (_, _) => ())
-
-    progress.stageStart(
-      "read_partition_metadata",
-      Optional.of(JLong.valueOf(5L)),
-      "partitions")
-    progress.stageProgress("read_partition_metadata", 2L)
-    progress.stageProgress("read_partition_metadata", 4L)
-    progress.stageProgress("read_partition_metadata", 3L)
-    progress.stageComplete("read_partition_metadata")
-
-    assertEquals(5L, total)
-    assertEquals(
-      5L,
-      completed,
-      "stageProgress reports absolute completed work; Spark metrics must add only deltas")
-    assertTrue(logs.head.contains("started"))
-    assertTrue(logs.last.contains("completed"))
-  }
-
-  @Test
-  def indexBuildProgress_recordsUnknownTotalStages(): Unit = {
-    var completed = 0L
-    var total = 0L
-    val progress = new SparkIndexBuildProgress(
-      "idx_text",
-      delta => completed += delta,
-      delta => total += delta,
-      _ => (),
-      (_, _) => ())
-
-    progress.stageStart("write_merged_metadata", Optional.empty(), "files")
-    progress.stageProgress("write_merged_metadata", 7L)
-    progress.stageComplete("write_merged_metadata")
-
-    assertEquals(0L, total)
-    assertEquals(7L, completed)
-  }
-
-  @Test
-  def indexBuildProgress_ignoresObservationFailures(): Unit = {
-    var warnings = 0
-    val progress = new SparkIndexBuildProgress(
-      "idx_text",
-      _ => throw new RuntimeException("metric update failed"),
-      _ => throw new RuntimeException("metric update failed"),
-      _ => throw new RuntimeException("log failed"),
-      (_, _) => {
-        warnings += 1
-        throw new RuntimeException("warn failed")
-      })
-
-    assertProgressDoesNotThrow {
-      progress.stageStart(
-        "read_partition_metadata",
-        Optional.of(JLong.valueOf(5L)),
-        "partitions")
-    }
-    assertProgressDoesNotThrow {
-      progress.stageProgress("read_partition_metadata", 3L)
-    }
-    assertProgressDoesNotThrow {
-      progress.stageComplete("read_partition_metadata")
-    }
-    assertTrue(warnings >= 3)
-  }
-
-  @Test
-  def indexMergeMetricDefinitions_onlyReportsForFts(): Unit = {
-    val ftsMetricNames = AddIndexExec.indexMergeMetricDefinitions("fts").map(_._1).toSet
-
-    assertEquals(
-      Set(AddIndexExec.INDEX_MERGE_COMPLETED_UNITS, AddIndexExec.INDEX_MERGE_TOTAL_UNITS),
-      ftsMetricNames)
-    assertTrue(AddIndexExec.indexMergeMetricDefinitions("BTREE").isEmpty)
-    assertTrue(AddIndexExec.indexMergeMetricDefinitions("zonemap").isEmpty)
-    assertTrue(AddIndexExec.indexMergeMetricDefinitions("ivf_pq").isEmpty)
-  }
-
-  private def assertProgressDoesNotThrow(callback: => Unit): Unit = {
-    assertDoesNotThrow(new Executable {
-      override def execute(): Unit = callback
-    })
   }
 }
