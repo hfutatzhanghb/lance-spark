@@ -52,8 +52,10 @@ FROM users;
 ALTER TABLE users ADD COLUMNS content FROM content_backfill;
 ```
 
-The source column must have Spark type `BINARY`. After the operation, reads expose `content` as a
-blob v2 descriptor struct, so descriptor fields can be queried without loading the bytes:
+The source column must have Spark type `BINARY`. Without the encoding property, `ADD COLUMNS`
+still succeeds and writes a plain `BINARY` column. With the encoding property set to `blob`, after
+the operation, reads expose `content` as a blob v2 descriptor struct, so descriptor fields can be
+queried without loading the bytes:
 
 ```sql
 SELECT id, content.size, content.kind FROM users;
