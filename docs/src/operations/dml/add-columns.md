@@ -45,6 +45,10 @@ TBLPROPERTIES (
 ALTER TABLE users
 SET TBLPROPERTIES ('content.lance.encoding' = 'blob');
 
+INSERT INTO users VALUES
+    (1, 'alpha'),
+    (2, 'bravo');
+
 CREATE TEMPORARY VIEW content_backfill AS
 SELECT _rowaddr, _fragid, CAST(name AS BINARY) AS content
 FROM users;
