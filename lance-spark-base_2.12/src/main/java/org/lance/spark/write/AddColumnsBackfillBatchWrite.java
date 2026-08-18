@@ -161,6 +161,10 @@ public class AddColumnsBackfillBatchWrite implements BatchWrite {
               .writeParams(
                   LanceRuntime.mergeStorageOptions(
                       writeOptions.getStorageOptions(), initialStorageOptions));
+      String fileFormatVersion = writeOptions.getFileFormatVersion();
+      if (fileFormatVersion != null) {
+        commitBuilder.storageFormat(fileFormatVersion);
+      }
       if (managedVersioning) {
         LanceNamespace namespace =
             LanceRuntime.getOrCreateNamespace(namespaceImpl, namespaceProperties);
@@ -168,10 +172,6 @@ public class AddColumnsBackfillBatchWrite implements BatchWrite {
             .namespaceClient(namespace)
             .tableId(tableId)
             .namespaceClientManagedVersioning(true);
-      }
-      String fileFormatVersion = writeOptions.getFileFormatVersion();
-      if (fileFormatVersion != null) {
-        commitBuilder.storageFormat(fileFormatVersion);
       }
       try (Transaction txn =
               new Transaction.Builder().readVersion(version).operation(merge).build();
