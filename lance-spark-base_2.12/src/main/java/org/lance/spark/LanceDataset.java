@@ -407,7 +407,8 @@ public class LanceDataset
           initialStorageOptions,
           namespaceImpl,
           namespaceProperties,
-          readOptions.getTableId());
+          readOptions.getTableId(),
+          managedVersioning);
     }
 
     List<String> updateColumns =
