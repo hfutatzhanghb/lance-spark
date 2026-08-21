@@ -27,6 +27,10 @@ ALTER TABLE users ADD COLUMNS name_hash FROM tmp_view;
 
 No table rewrite, no data movement—just a new column that is instantly queryable.
 
+!!! note
+    Because we use `_rowaddr` and `_fragid` to address the target dataset's rows for the new column's data,
+    the temporary view should contain `_rowaddr` and `_fragid`.
+
 ## Adding a Blob v2 Column
 
 To add a blob v2 column, create the target table with Lance file format version `2.2` or higher,
@@ -72,7 +76,3 @@ descriptor struct, so descriptor fields can be queried without loading the bytes
 ```sql
 SELECT id, content.size, content.kind FROM users;
 ```
-
-!!! note
-    Because we use `_rowaddr` and `_fragid` to address the target dataset's rows for the new column's data, 
-    the temporary view should contain `_rowaddr` and `_fragid`.
