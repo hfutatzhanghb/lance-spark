@@ -2278,10 +2278,17 @@ class TestDMLAddColumn:
             )
         """)
 
+        first_content = b"alpha"
+        second_content = b"bravo-charlie"
+
         spark.sql("""
             INSERT INTO default.test_table VALUES
-            (1, 'alpha'),
-            (2, 'bravo')
+            (1, 'alpha')
+        """)
+
+        spark.sql("""
+            INSERT INTO default.test_table VALUES
+            (2, 'bravo-charlie')
         """)
 
         spark.sql("""
@@ -2299,7 +2306,10 @@ class TestDMLAddColumn:
             for row in spark.sql("DESCRIBE default.test_table").collect()
             if row.col_name == "content"
         )
-        assert "struct" in content_field.data_type.lower()
+        content_type = content_field.data_type.lower()
+        assert "struct" in content_type
+        assert "kind" in content_type
+        assert "blob_uri" in content_type
 
         rows = spark.sql("""
             SELECT id, content.size, content.kind
@@ -2308,8 +2318,8 @@ class TestDMLAddColumn:
         """).collect()
 
         assert [(row.id, row.size, row.kind) for row in rows] == [
-            (1, len(b"alpha"), 0),
-            (2, len(b"bravo"), 0),
+            (1, len(first_content), 0),
+            (2, len(second_content), 0),
         ]
 
         spark.sql("""
