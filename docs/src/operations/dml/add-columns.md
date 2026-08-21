@@ -33,6 +33,12 @@ To add a blob v2 column, create the target table with Lance file format version 
 then persist the future `BINARY` column's blob encoding with `ALTER TABLE SET TBLPROPERTIES` before
 adding the column.
 
+If the target table uses a file format below `2.2`, `ADD COLUMNS` still succeeds, but the `BINARY`
+column is written with legacy blob v1 encoding. Tables created without an explicit
+`file_format_version` may also use an older format, so set it to `2.2` or higher before adding the
+column. For more details, see
+[Blob v2 Writes](../../config.md#blob-v2-writes).
+
 ```sql
 CREATE TABLE users (
     id INT,
