@@ -2445,8 +2445,7 @@ class TestDMLAddColumn:
 
     @pytest.mark.requires_rest
     @pytest.mark.rest_dir_compatible
-    def test_add_column_namespace_backend(self, spark, test_table):
-        """Test ADD COLUMNS FROM against a namespace-managed table."""
+    def test_add_column_from_view_on_rest(self, spark, test_table):
         spark.sql(f"""
             CREATE TABLE {test_table} (
                 id INT,
@@ -2487,8 +2486,7 @@ class TestDMLUpdateColumn:
 
     @pytest.mark.requires_rest
     @pytest.mark.rest_dir_compatible
-    def test_update_column_namespace_backend(self, spark, test_table):
-        """Test UPDATE COLUMNS FROM against a namespace-managed table."""
+    def test_update_column_from_view_on_rest(self, spark, test_table):
         spark.sql(f"""
             CREATE TABLE {test_table} (
                 id INT,
