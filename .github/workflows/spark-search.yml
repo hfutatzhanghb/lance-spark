@@ -27,6 +27,7 @@ on:
       - "lance-spark-base_2.12/src/main/java/org/lance/spark/LanceDataset.java"
       - "lance-spark-base_2.12/src/main/java/org/lance/spark/search/**"
       - "lance-spark-base_2.12/src/main/java/org/lance/spark/write/*ColumnsBackfill*.java"
+      - "lance-spark-base_2.12/src/main/scala/org/apache/spark/sql/execution/datasources/v2/*ColumnsBackfillExec.scala"
       - "lance-spark-base_2.12/src/main/scala/org/lance/spark/search/**"
       - "lance-spark-base_2.12/src/test/java/org/lance/spark/search/**"
       - "lance-spark-*/src/main/scala/org/lance/spark/extensions/**"
