@@ -196,6 +196,10 @@ LANCE_SPARK_REST_DIR_ROOT = os.environ.get(
     "/home/lance/rest-data",
 )
 LANCE_SPARK_REST_DIR_PORT = int(os.environ.get("LANCE_SPARK_REST_DIR_PORT", "10024"))
+LANCE_SPARK_REST_DIR_MANAGED_VERSIONING = os.environ.get(
+    "LANCE_SPARK_REST_DIR_MANAGED_VERSIONING",
+    "",
+).lower() in ("1", "true", "yes")
 AWS_S3_BUCKET_NAME = os.environ.get("AWS_S3_BUCKET_NAME")
 AWS_REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
 AWS_GLUE_CATALOG_ID = os.environ.get("AWS_GLUE_CATALOG_ID")
@@ -403,6 +407,7 @@ def rest_dir_namespace():
                 LANCE_SPARK_REST_DIR_ROOT,
                 "127.0.0.1",
                 str(port),
+                str(LANCE_SPARK_REST_DIR_MANAGED_VERSIONING).lower(),
             ],
             stdout=log,
             stderr=subprocess.STDOUT,

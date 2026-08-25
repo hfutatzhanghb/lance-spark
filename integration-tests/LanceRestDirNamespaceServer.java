@@ -25,16 +25,23 @@ public final class LanceRestDirNamespaceServer {
     String root = args.length > 0 ? args[0] : "/home/lance/rest-data";
     String host = args.length > 1 ? args[1] : "127.0.0.1";
     int port = args.length > 2 ? Integer.parseInt(args[2]) : 10024;
+    boolean managedVersioning = args.length > 3 && Boolean.parseBoolean(args[3]);
 
     Map<String, String> backendConfig = new HashMap<>();
     backendConfig.put("root", root);
+    if (managedVersioning) {
+      // DirectoryNamespace uses manifest storage to track versions managed by the namespace.
+      backendConfig.put("manifest_enabled", "true");
+      backendConfig.put("table_version_tracking_enabled", "true");
+    }
 
     RestAdapter adapter = new RestAdapter("dir", backendConfig, host, port);
     Runtime.getRuntime().addShutdownHook(new Thread(adapter::close));
     adapter.start();
     System.out.printf(
-        "Lance REST directory namespace listening on http://%s:%d with root %s%n",
-        host, adapter.getPort(), root);
+        "Lance REST directory namespace listening on http://%s:%d with root %s "
+            + "(managed versioning: %s)%n",
+        host, adapter.getPort(), root, managedVersioning);
     new CountDownLatch(1).await();
   }
 }
