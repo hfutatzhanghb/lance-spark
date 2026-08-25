@@ -424,7 +424,7 @@ public abstract class BaseUpdateColumnsBackfillTest {
 
       UpdateColumnsBackfillBatchWrite updateWrite =
           new UpdateColumnsBackfillBatchWrite(
-              updateSchema, writeOptions, updateColumns, null, null, null, null);
+              updateSchema, writeOptions, updateColumns, null, null, null, null, false);
 
       DataWriterFactory factory = updateWrite.createBatchWriterFactory(() -> 1);
       WriterCommitMessage updateMsg;

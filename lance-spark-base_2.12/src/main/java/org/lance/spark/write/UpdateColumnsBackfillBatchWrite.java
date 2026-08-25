@@ -19,6 +19,7 @@ import org.lance.Fragment;
 import org.lance.FragmentMetadata;
 import org.lance.Transaction;
 import org.lance.fragment.FragmentUpdateResult;
+import org.lance.namespace.LanceNamespace;
 import org.lance.operation.Update;
 import org.lance.spark.LanceDataset;
 import org.lance.spark.LanceRef;
@@ -74,6 +75,7 @@ public class UpdateColumnsBackfillBatchWrite implements BatchWrite {
 
   private final Map<String, String> namespaceProperties;
   private final List<String> tableId;
+  private final boolean managedVersioning;
 
   public UpdateColumnsBackfillBatchWrite(
       StructType schema,
@@ -82,7 +84,8 @@ public class UpdateColumnsBackfillBatchWrite implements BatchWrite {
       Map<String, String> initialStorageOptions,
       String namespaceImpl,
       Map<String, String> namespaceProperties,
-      List<String> tableId) {
+      List<String> tableId,
+      boolean managedVersioning) {
     this.schema = schema;
     try (Dataset ds = Utils.openDatasetBuilder(writeOptions).build()) {
       this.writeOptions = writeOptions.withRef(LanceRef.ofMain(ds.version()));
@@ -93,6 +96,7 @@ public class UpdateColumnsBackfillBatchWrite implements BatchWrite {
     this.namespaceImpl = namespaceImpl;
     this.namespaceProperties = namespaceProperties;
     this.tableId = tableId;
+    this.managedVersioning = managedVersioning;
   }
 
   @Override
@@ -175,6 +179,14 @@ public class UpdateColumnsBackfillBatchWrite implements BatchWrite {
       String fileFormatVersion = writeOptions.getFileFormatVersion();
       if (fileFormatVersion != null) {
         commitBuilder.storageFormat(fileFormatVersion);
+      }
+      if (managedVersioning) {
+        LanceNamespace namespace =
+            LanceRuntime.getOrCreateNamespace(namespaceImpl, namespaceProperties);
+        commitBuilder
+            .namespaceClient(namespace)
+            .tableId(tableId)
+            .namespaceClientManagedVersioning(true);
       }
       try (Transaction txn =
               new Transaction.Builder().readVersion(version).operation(update).build();

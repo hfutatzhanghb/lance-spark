@@ -425,7 +425,8 @@ public class LanceDataset
           initialStorageOptions,
           namespaceImpl,
           namespaceProperties,
-          readOptions.getTableId());
+          readOptions.getTableId(),
+          managedVersioning);
     }
 
     SparkWrite.SparkWriteBuilder builder =

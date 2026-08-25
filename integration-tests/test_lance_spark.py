@@ -2485,6 +2485,47 @@ class TestDMLAddColumn:
 class TestDMLUpdateColumn:
     """Test DML UPDATE COLUMNS FROM operations for updating existing columns via backfill."""
 
+    @pytest.mark.requires_rest
+    @pytest.mark.rest_dir_compatible
+    def test_update_column_namespace_backend(self, spark, test_table):
+        """Test UPDATE COLUMNS FROM against a namespace-managed table."""
+        spark.sql(f"""
+            CREATE TABLE {test_table} (
+                id INT,
+                name STRING,
+                value INT
+            )
+        """)
+
+        spark.sql(f"""
+            INSERT INTO {test_table} VALUES
+            (1, 'alpha', 10),
+            (2, 'bravo', 20)
+        """)
+
+        spark.sql(f"""
+            CREATE OR REPLACE TEMPORARY VIEW namespace_update_columns_view AS
+            SELECT _rowaddr, _fragid, value * 10 AS value
+            FROM {test_table}
+            WHERE id = 2
+        """)
+
+        spark.sql(f"""
+            ALTER TABLE {test_table}
+            UPDATE COLUMNS value FROM namespace_update_columns_view
+        """)
+
+        rows = spark.sql(f"""
+            SELECT id, name, value
+            FROM {test_table}
+            ORDER BY id
+        """).collect()
+
+        assert [(row.id, row.name, row.value) for row in rows] == [
+            (1, "alpha", 10),
+            (2, "bravo", 200),
+        ]
+
     def test_update_single_column(self, spark):
         """Test ALTER TABLE UPDATE COLUMNS FROM with a single column."""
         spark.sql("""
