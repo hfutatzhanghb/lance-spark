@@ -23,6 +23,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, GenericInternalRow}
 import org.apache.spark.sql.catalyst.plans.logical.{AddIndexOutputType, LanceNamedArgument}
 import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog}
+import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.LanceArrowUtils
 import org.apache.spark.sql.util.LanceSerializeUtil.{decode, encode}
@@ -38,10 +39,13 @@ import org.lance.spark.utils.{CloseableUtil, FieldPathUtils, Utils}
 import org.lance.spark.write.SingleBatchArrowReader
 
 import java.util.{Collections, Locale, UUID}
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.{ArrayBuffer, PriorityQueue}
 import scala.reflect.ClassTag
+import scala.util.control.NonFatal
 
 /**
  * Physical execution of distributed CREATE INDEX (ALTER TABLE ... CREATE INDEX ...) for Lance datasets.
@@ -79,6 +83,11 @@ case class AddIndexExec(
     args: Seq[LanceNamedArgument]) extends LeafV2CommandExec {
 
   override def output: Seq[Attribute] = AddIndexOutputType.SCHEMA
+
+  override lazy val metrics: Map[String, SQLMetric] =
+    AddIndexExec.indexSegmentMetricDefinitions(method, args).map { case (name, description) =>
+      name -> SQLMetrics.createMetric(sparkContext, description)
+    }.toMap
 
   override protected def run(): Seq[InternalRow] = {
     val lanceDataset = LanceDataset.requireWritable(catalog.loadTable(ident), "AddIndex")
@@ -189,7 +198,8 @@ case class AddIndexExec(
         nsImpl,
         nsProps,
         tableId,
-        initialStorageOpts)
+        initialStorageOpts,
+        createIndexSegmentProgress())
       val segments = segmentJob.run()
       // Atomic add+remove via Lance core; see commitIndexSegments
       commitIndexSegments(readOptions, canonicalColumns.head, segments)
@@ -200,6 +210,14 @@ case class AddIndexExec(
 
     throw new UnsupportedOperationException(s"Unsupported index type: $indexType")
   }
+
+  private def createIndexSegmentProgress(): SparkIndexSegmentProgress =
+    new SparkIndexSegmentProgress(
+      indexName,
+      completedDelta => metrics(AddIndexExec.INDEX_BUILD_COMPLETED_SEGMENTS).add(completedDelta),
+      totalDelta => metrics(AddIndexExec.INDEX_BUILD_TOTAL_SEGMENTS).add(totalDelta),
+      message => logInfo(message),
+      (message, cause) => logWarning(message, cause))
 
   /** Commits an empty (untrained) index on the driver, with an empty fragment bitmap. */
   private def commitEmptyIndex(
@@ -264,6 +282,98 @@ case class AddIndexExec(
     }
   }
 
+}
+
+private[datasources] object AddIndexExec {
+  private[datasources] val INDEX_BUILD_COMPLETED_SEGMENTS = "indexBuildCompletedSegments"
+  private[datasources] val INDEX_BUILD_TOTAL_SEGMENTS = "indexBuildTotalSegments"
+
+  private[datasources] def indexSegmentMetricDefinitions(
+      method: String,
+      args: Seq[LanceNamedArgument]): Map[String, String] = {
+    val usesSegmentBuild =
+      try {
+        val indexType = IndexUtils.buildIndexType(method)
+        IndexUtils.extractTrain(args) &&
+        IndexUtils.scalarSegmentIndexType(method).isDefined &&
+        !IndexUtils.btreeBuildMode(indexType, args).contains("range")
+      } catch {
+        case NonFatal(_) => false
+      }
+
+    if (usesSegmentBuild) {
+      Map(
+        INDEX_BUILD_COMPLETED_SEGMENTS -> "index build completed segments",
+        INDEX_BUILD_TOTAL_SEGMENTS -> "index build total segments")
+    } else {
+      Map.empty
+    }
+  }
+}
+
+private[datasources] class SparkIndexSegmentProgress(
+    indexName: String,
+    addCompletedDelta: Long => Unit,
+    addTotalDelta: Long => Unit,
+    logStatus: String => Unit,
+    logWarningStatus: (String, Throwable) => Unit) {
+
+  private val totalSegments = new AtomicLong(0L)
+  private val completedSegments = new AtomicLong(0L)
+  private val completedPartitions = ConcurrentHashMap.newKeySet[Integer]()
+
+  def start(total: Int): Unit = {
+    val previousTotal = totalSegments.getAndSet(total.toLong)
+    addDelta(
+      addTotalDelta,
+      "update index build total segments metric",
+      total.toLong - previousTotal)
+    logProgress(s"Index '$indexName' segment build started (0/$total segments)")
+  }
+
+  def segmentComplete(partitionId: Int): Unit = {
+    if (completedPartitions.add(Integer.valueOf(partitionId))) {
+      val completed = completedSegments.incrementAndGet()
+      addDelta(
+        addCompletedDelta,
+        "update index build completed segments metric",
+        1L)
+      logProgress(
+        s"Index '$indexName' segment build progress: " +
+          s"$completed/${totalSegments.get()} segments completed")
+    }
+  }
+
+  private def addDelta(add: Long => Unit, action: String, delta: Long): Unit = {
+    if (delta != 0L) {
+      observe(action) {
+        add(delta)
+      }
+    }
+  }
+
+  private def logProgress(message: String): Unit = {
+    observe("log index build progress") {
+      logStatus(message)
+    }
+  }
+
+  private def observe(action: String)(callback: => Unit): Unit = {
+    try {
+      callback
+    } catch {
+      case NonFatal(e) =>
+        warn(s"Ignoring failure to $action for index '$indexName'", e)
+    }
+  }
+
+  private def warn(message: String, cause: Throwable): Unit = {
+    try {
+      logWarningStatus(message, cause)
+    } catch {
+      case NonFatal(_) =>
+    }
+  }
 }
 
 /**
@@ -480,7 +590,8 @@ class ScalarSegmentIndexJob(
     nsImpl: Option[String],
     nsProps: Option[Map[String, String]],
     tableId: Option[List[String]],
-    initialStorageOpts: Option[Map[String, String]]) {
+    initialStorageOpts: Option[Map[String, String]],
+    progress: SparkIndexSegmentProgress) {
 
   def run(): Seq[Index] = {
     val indexType = IndexUtils.scalarSegmentIndexType(addIndexExec.method).getOrElse {
@@ -512,7 +623,8 @@ class ScalarSegmentIndexJob(
       addIndexExec.session.sparkContext,
       tasks,
       s"${indexType.name()} index build failed. Uncommitted segments are not " +
-        "visible to readers and will not affect query correctness.")(_.execute())
+        "visible to readers and will not affect query correctness.",
+      progress)(_.execute())
   }
 }
 
@@ -717,16 +829,26 @@ object IndexUtils extends Logging {
   def runSegmentTasks[T <: Serializable: ClassTag](
       sc: org.apache.spark.SparkContext,
       tasks: Seq[T],
-      failureMessage: String)(execute: T => String): Seq[Index] = {
+      failureMessage: String,
+      progress: SparkIndexSegmentProgress)(execute: T => String): Seq[Index] = {
     if (tasks.isEmpty) {
       Seq.empty
     } else {
       try {
-        sc.parallelize(tasks, tasks.size)
-          .map(execute)
-          .collect()
-          .map(encoded => decode[Index](encoded))
-          .toSeq
+        val encodedResults = new Array[String](tasks.size)
+        val taskRdd = sc.parallelize(tasks, tasks.size)
+        progress.start(tasks.size)
+        // Spark invokes the result handler on the driver once for each successful output
+        // partition. This preserves the independent-segment retry/speculation semantics while
+        // exposing live progress before the full job result is available.
+        sc.runJob(
+          taskRdd,
+          (taskIterator: Iterator[T]) => execute(taskIterator.next()),
+          (partitionId: Int, encoded: String) => {
+            encodedResults(partitionId) = encoded
+            progress.segmentComplete(partitionId)
+          })
+        encodedResults.map(encoded => decode[Index](encoded)).toSeq
       } catch {
         case e: Exception => throw new RuntimeException(failureMessage, e)
       }

@@ -16,7 +16,10 @@ package org.apache.spark.sql.execution.datasources.v2
 import org.apache.spark.sql.catalyst.plans.logical.LanceNamedArgument
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.function.Executable
 import org.lance.index.IndexType
+
+import scala.collection.mutable.ArrayBuffer
 
 /**
  * Unit tests for [[IndexUtils]] helper methods.
@@ -256,5 +259,82 @@ class IndexUtilsTest {
     assertThrows(
       classOf[ArithmeticException],
       () => IndexUtils.batchFragments(fragmentWorkloads(Long.MaxValue, 1), Some(1), 1))
+  }
+
+  @Test
+  def indexSegmentProgress_reportsSuccessfulPartitionsOnce(): Unit = {
+    var completed = 0L
+    var total = 0L
+    val logs = ArrayBuffer.empty[String]
+    val progress = new SparkIndexSegmentProgress(
+      "idx_text",
+      delta => completed += delta,
+      delta => total += delta,
+      message => logs += message,
+      (_, _) => ())
+
+    progress.start(3)
+    progress.segmentComplete(2)
+    progress.segmentComplete(0)
+    progress.segmentComplete(2)
+    progress.segmentComplete(1)
+
+    assertEquals(3L, total)
+    assertEquals(
+      3L,
+      completed,
+      "a retried or duplicate partition result must not increment progress twice")
+    assertTrue(logs.head.contains("started"))
+    assertTrue(logs.last.contains("3/3 segments completed"))
+  }
+
+  @Test
+  def indexSegmentProgress_ignoresObservationFailures(): Unit = {
+    var warnings = 0
+    val progress = new SparkIndexSegmentProgress(
+      "idx_text",
+      _ => throw new RuntimeException("metric update failed"),
+      _ => throw new RuntimeException("metric update failed"),
+      _ => throw new RuntimeException("log failed"),
+      (_, _) => {
+        warnings += 1
+        throw new RuntimeException("warn failed")
+      })
+
+    assertProgressDoesNotThrow {
+      progress.start(2)
+    }
+    assertProgressDoesNotThrow {
+      progress.segmentComplete(0)
+    }
+    assertTrue(warnings >= 4)
+  }
+
+  @Test
+  def indexSegmentMetricDefinitions_onlyReportsForEagerSegmentBuilds(): Unit = {
+    val ftsMetricNames =
+      AddIndexExec.indexSegmentMetricDefinitions("fts", Seq.empty).keySet
+
+    assertEquals(
+      Set(
+        AddIndexExec.INDEX_BUILD_COMPLETED_SEGMENTS,
+        AddIndexExec.INDEX_BUILD_TOTAL_SEGMENTS),
+      ftsMetricNames)
+    assertFalse(AddIndexExec.indexSegmentMetricDefinitions("BTREE", Seq.empty).isEmpty)
+    assertTrue(
+      AddIndexExec.indexSegmentMetricDefinitions(
+        "btree",
+        Seq(LanceNamedArgument("build_mode", "range"))).isEmpty)
+    assertTrue(
+      AddIndexExec.indexSegmentMetricDefinitions(
+        "fts",
+        Seq(LanceNamedArgument("train", java.lang.Boolean.FALSE))).isEmpty)
+    assertTrue(AddIndexExec.indexSegmentMetricDefinitions("ivf_pq", Seq.empty).isEmpty)
+  }
+
+  private def assertProgressDoesNotThrow(callback: => Unit): Unit = {
+    assertDoesNotThrow(new Executable {
+      override def execute(): Unit = callback
+    })
   }
 }

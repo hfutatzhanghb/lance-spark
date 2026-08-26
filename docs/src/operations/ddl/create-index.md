@@ -284,6 +284,12 @@ The `CREATE INDEX` command returns the following information about the operation
 | `fragments_indexed` | Long   | The number of fragments that were indexed. |
 | `index_name`        | String | The name of the created index.         |
 
+For eager distributed segment builds, Lance Spark reports driver-side progress through Spark SQL
+metrics named `index build completed segments` and `index build total segments`. The driver also
+logs progress as successful segment tasks return. Task retries and speculative attempts are counted
+once per successful Spark partition. Progress reporting is informational and does not change the
+command output or the atomic segment commit.
+
 ## When to Use an Index
 
 Consider creating an index when:
