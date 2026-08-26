@@ -32,6 +32,8 @@ import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.execution.CommandResultExec;
+import org.apache.spark.sql.execution.metric.SQLMetric;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.MetadataBuilder;
@@ -46,6 +48,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import scala.collection.JavaConverters;
 
 import java.io.IOException;
 import java.nio.file.FileSystems;
@@ -400,6 +403,18 @@ public abstract class BaseAddIndexTest {
           fragmentCount,
           coveredFragments,
           "Expected committed segments to cover all fragments exactly once");
+
+      CommandResultExec commandResult = (CommandResultExec) result.queryExecution().executedPlan();
+      Map<String, SQLMetric> progressMetrics =
+          JavaConverters.mapAsJavaMap(commandResult.commandPhysicalPlan().metrics());
+      Assertions.assertEquals(
+          expectedSegmentCount,
+          progressMetrics.get("indexBuildTotalSegments").value(),
+          "Expected progress to report the planned segment count");
+      Assertions.assertEquals(
+          expectedSegmentCount,
+          progressMetrics.get("indexBuildCompletedSegments").value(),
+          "Expected progress to report every successfully built segment");
     } finally {
       lanceDataset.close();
     }
