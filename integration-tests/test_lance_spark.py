@@ -1839,6 +1839,17 @@ class TestDQLSearchTableFunctions:
 class TestDQLSelect:
     """Test DQL SELECT operations."""
 
+    def test_cache_backend_catalog_session_reads_written_table(self, spark, test_table):
+        """Verify catalog cache backends are used by a real Spark write/read path."""
+        spark.sql(f"CREATE TABLE {test_table} (id INT, value STRING)")
+        spark.createDataFrame([(1, "one"), (2, "two")], ["id", "value"]) \
+            .writeTo(test_table).append()
+
+        jvm = spark._jvm
+        runtime_session = jvm.org.lance.spark.LanceRuntime.session(LANCE_CATALOG)
+        assert not runtime_session.isClosed()
+        assert spark.sql(f"SELECT id FROM {test_table} ORDER BY id").collect() == [(1,), (2,)]
+
     def test_select_all(self, spark):
         """Test SELECT * query."""
         spark.sql("""
@@ -2432,9 +2443,86 @@ class TestDMLAddColumn:
         assert result[1].total_compensation == 69000   # 60000 + 9000
         assert result[2].total_compensation == 84000   # 70000 + 14000
 
+    @pytest.mark.requires_rest
+    @pytest.mark.rest_dir_compatible
+    def test_add_column_from_view_on_rest(self, spark, test_table):
+        spark.sql(f"""
+            CREATE TABLE {test_table} (
+                id INT,
+                name STRING
+            )
+        """)
+
+        spark.sql(f"""
+            INSERT INTO {test_table} VALUES
+            (1, 'alpha'),
+            (2, 'bravo')
+        """)
+
+        spark.sql(f"""
+            CREATE OR REPLACE TEMPORARY VIEW namespace_add_columns_view AS
+            SELECT _rowaddr, _fragid, name AS name_copy
+            FROM {test_table}
+        """)
+
+        spark.sql(f"""
+            ALTER TABLE {test_table} ADD COLUMNS name_copy FROM namespace_add_columns_view
+        """)
+
+        rows = spark.sql(f"""
+            SELECT id, name, name_copy
+            FROM {test_table}
+            ORDER BY id
+        """).collect()
+
+        assert [(row.id, row.name, row.name_copy) for row in rows] == [
+            (1, "alpha", "alpha"),
+            (2, "bravo", "bravo"),
+        ]
+
 
 class TestDMLUpdateColumn:
     """Test DML UPDATE COLUMNS FROM operations for updating existing columns via backfill."""
+
+    @pytest.mark.requires_rest
+    @pytest.mark.rest_dir_compatible
+    def test_update_column_from_view_on_rest(self, spark, test_table):
+        spark.sql(f"""
+            CREATE TABLE {test_table} (
+                id INT,
+                name STRING,
+                value INT
+            )
+        """)
+
+        spark.sql(f"""
+            INSERT INTO {test_table} VALUES
+            (1, 'alpha', 10),
+            (2, 'bravo', 20)
+        """)
+
+        spark.sql(f"""
+            CREATE OR REPLACE TEMPORARY VIEW namespace_update_columns_view AS
+            SELECT _rowaddr, _fragid, value * 10 AS value
+            FROM {test_table}
+            WHERE id = 2
+        """)
+
+        spark.sql(f"""
+            ALTER TABLE {test_table}
+            UPDATE COLUMNS value FROM namespace_update_columns_view
+        """)
+
+        rows = spark.sql(f"""
+            SELECT id, name, value
+            FROM {test_table}
+            ORDER BY id
+        """).collect()
+
+        assert [(row.id, row.name, row.value) for row in rows] == [
+            (1, "alpha", 10),
+            (2, "bravo", 200),
+        ]
 
     def test_update_single_column(self, spark):
         """Test ALTER TABLE UPDATE COLUMNS FROM with a single column."""
@@ -2691,6 +2779,49 @@ class TestDQLTimeTravel:
         assert len(result) == 1
         assert result[0].id == 1
 
+    def test_tag_as_of_excludes_data_inserted_after_tag_creation(self, spark):
+        """Test that a tag remains on its snapshot after the main table advances."""
+        spark.sql("""
+            CREATE TABLE default.test_table (
+                id INT,
+                name STRING
+            )
+        """)
+        spark.sql("""
+            INSERT INTO default.test_table VALUES
+            (1, 'before_tag_1'),
+            (2, 'before_tag_2')
+        """)
+        spark.sql("ALTER TABLE default.test_table CREATE TAG stable")
+
+        spark.sql("""
+            INSERT INTO default.test_table VALUES
+            (3, 'after_tag_1'),
+            (4, 'after_tag_2')
+        """)
+
+        tagged = spark.sql("""
+            SELECT id, name
+            FROM default.test_table VERSION AS OF 'stable'
+            ORDER BY id
+        """).collect()
+        current = spark.sql("""
+            SELECT id, name
+            FROM default.test_table
+            ORDER BY id
+        """).collect()
+
+        assert [(row.id, row.name) for row in tagged] == [
+            (1, "before_tag_1"),
+            (2, "before_tag_2"),
+        ]
+        assert [(row.id, row.name) for row in current] == [
+            (1, "before_tag_1"),
+            (2, "before_tag_2"),
+            (3, "after_tag_1"),
+            (4, "after_tag_2"),
+        ]
+
     @requires_update_or_merge
     def test_version_as_of_after_update(self, spark):
         """Test VERSION AS OF returns data before an update."""
@@ -2748,6 +2879,103 @@ class TestDQLTimeTravel:
             SELECT * FROM default.test_table VERSION AS OF 2
         """).collect()
         assert len(result) == 3
+
+
+class TestDQLBranchRead:
+    def test_branch_identifier_matches_option_and_path(self, spark):
+        spark.sql("CREATE TABLE default.test_table (id INT, name STRING)")
+        spark.sql(
+            "INSERT INTO default.test_table VALUES (1, 'a'), (2, 'b')"
+        )
+        expected = [(1, "a"), (2, "b")]
+        spark.sql(
+            "ALTER TABLE default.test_table CREATE BRANCH test_branch"
+        )
+        spark.sql(
+            "INSERT INTO default.test_table VALUES (3, 'c'), (4, 'd')"
+        )
+
+        identifier = spark.sql(
+            "SELECT * FROM default.test_table.branch_test_branch ORDER BY id"
+        ).collect()
+        option_table = (
+            spark.read.option("branch", "test_branch")
+            .table("default.test_table")
+            .orderBy("id")
+            .collect()
+        )
+        option_path = (
+            spark.read.format("lance")
+            .option("branch", "test_branch")
+            .load(_table_location(spark, "default.test_table"))
+            .orderBy("id")
+            .collect()
+        )
+        main = spark.sql(
+            "SELECT * FROM default.test_table ORDER BY id"
+        ).collect()
+
+        assert [(row.id, row.name) for row in identifier] == expected
+        assert [(row.id, row.name) for row in option_table] == expected
+        assert [(row.id, row.name) for row in option_path] == expected
+        assert [(row.id, row.name) for row in main] == expected + [(3, "c"), (4, "d")]
+
+    def test_branch_identifier_rejects_as_of_and_conflicting_options(self, spark):
+        spark.sql("CREATE TABLE default.test_table (id INT, name STRING)")
+        spark.sql("INSERT INTO default.test_table VALUES (1, 'main')")
+        spark.sql("ALTER TABLE default.test_table CREATE BRANCH audit")
+
+        with pytest.raises(Exception, match="Cannot combine"):
+            spark.sql(
+                "SELECT * FROM default.test_table.branch_audit VERSION AS OF 1"
+            ).collect()
+        with pytest.raises(Exception, match="Cannot combine"):
+            spark.sql(
+                "SELECT * FROM default.test_table.branch_audit TIMESTAMP AS OF now()"
+            ).collect()
+        with pytest.raises(Exception):
+            spark.read.option("branch", "audit").option("version", "1").table(
+                "default.test_table"
+            ).collect()
+        with pytest.raises(Exception, match="no_such_branch"):
+            spark.read.option("branch", "no_such_branch").table(
+                "default.test_table"
+            ).collect()
+
+    def test_branch_identifier_is_read_only(self, spark):
+        spark.sql("CREATE TABLE default.test_table (id INT, name STRING)")
+        spark.sql("INSERT INTO default.test_table VALUES (1, 'main')")
+        spark.sql("ALTER TABLE default.test_table CREATE BRANCH audit")
+
+        with pytest.raises(Exception):
+            spark.sql(
+                "INSERT INTO default.test_table.branch_audit VALUES (2, 'branch')"
+            ).collect()
+
+        assert spark.table("default.test_table").count() == 1
+        assert spark.table("default.test_table.branch_audit").count() == 1
+
+    def test_existing_table_wins_over_branch_identifier(self, spark):
+        if getattr(spark, "_lance_backend", None) == "glue":
+            pytest.skip("Glue table identifiers are database.table")
+        spark.sql("CREATE TABLE default.test_table (id INT, name STRING)")
+        spark.sql("INSERT INTO default.test_table VALUES (1, 'branch_row')")
+        spark.sql("ALTER TABLE default.test_table CREATE BRANCH audit")
+        spark.sql(
+            "CREATE TABLE default.test_table.branch_audit (id INT, name STRING)"
+        )
+        spark.sql(
+            "INSERT INTO default.test_table.branch_audit VALUES (99, 'literal')"
+        )
+
+        rows = spark.table("default.test_table.branch_audit").collect()
+        assert [(row.id, row.name) for row in rows] == [(99, "literal")]
+        assert [
+            row.id
+            for row in spark.read.option("branch", "audit")
+            .table("default.test_table")
+            .collect()
+        ] == [1]
 
 
 @requires_update_or_merge
