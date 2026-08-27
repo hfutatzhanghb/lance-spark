@@ -67,6 +67,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
@@ -104,6 +105,7 @@ public abstract class BaseAddIndexTest {
   protected String fullTable = catalogName + ".default." + tableName;
 
   protected SparkSession spark;
+  private DriverMetricSnapshotListener metricListener;
 
   @TempDir Path tempDir;
   protected String tableDir;
@@ -135,6 +137,9 @@ public abstract class BaseAddIndexTest {
   @AfterEach
   public void tearDown() throws IOException {
     if (spark != null) {
+      if (metricListener != null) {
+        spark.sparkContext().removeSparkListener(metricListener);
+      }
       spark.close();
     }
   }
@@ -398,7 +403,7 @@ public abstract class BaseAddIndexTest {
   public void testCreateZonemapIndexWithNumSegments() throws Exception {
     prepareDataset();
 
-    DriverMetricSnapshotListener metricListener = new DriverMetricSnapshotListener();
+    metricListener = new DriverMetricSnapshotListener();
     spark.sparkContext().addSparkListener(metricListener);
     Dataset<Row> result =
         spark.sql(
@@ -451,7 +456,16 @@ public abstract class BaseAddIndexTest {
           completedMetric.value(),
           "Expected progress to report every successfully built segment");
 
-      spark.sparkContext().listenerBus().waitUntilEmpty(5000);
+      try {
+        spark.sparkContext().listenerBus().waitUntilEmpty(10000);
+      } catch (TimeoutException timeout) {
+        List<Map<Long, Long>> receivedSnapshots =
+            metricListener.snapshotsContaining(completedMetric.id(), totalMetric.id());
+        Assertions.fail(
+            "Timed out waiting for Spark listener events; received progress snapshots: "
+                + receivedSnapshots,
+            timeout);
+      }
       List<Map<Long, Long>> progressSnapshots =
           metricListener.snapshotsContaining(completedMetric.id(), totalMetric.id());
       Assertions.assertFalse(

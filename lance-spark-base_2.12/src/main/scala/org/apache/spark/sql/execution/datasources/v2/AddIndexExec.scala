@@ -217,6 +217,7 @@ case class AddIndexExec(
     val totalMetric = metrics(AddIndexExec.INDEX_BUILD_TOTAL_SEGMENTS)
     // runJob invokes its result handler on the DAGScheduler thread, which does not inherit the
     // command thread's Spark local properties. Capture the SQL execution ID before entering it.
+    // Spark tolerates a null ID by skipping listener publication; driver logs remain available.
     val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
 
     new SparkIndexSegmentProgress(
@@ -858,6 +859,8 @@ object IndexUtils extends Logging {
     } else {
       try {
         val encodedResults = new Array[String](tasks.size)
+        // parallelize with one slice per task must produce exactly one task in every partition.
+        // Validate that invariant inside the job so empty or multi-task partitions fail clearly.
         val taskRdd = sc.parallelize(tasks, tasks.size)
         progress.start(tasks.size)
         // Spark invokes the result handler on the driver once for each successful output
@@ -865,7 +868,7 @@ object IndexUtils extends Logging {
         // exposing live progress before the full job result is available.
         sc.runJob(
           taskRdd,
-          (taskIterator: Iterator[T]) => execute(taskIterator.next()),
+          (taskIterator: Iterator[T]) => executeSinglePartitionTask(taskIterator)(execute),
           (partitionId: Int, encoded: String) => {
             encodedResults(partitionId) = encoded
             progress.segmentComplete(partitionId)
@@ -875,6 +878,20 @@ object IndexUtils extends Logging {
         case e: Exception => throw new RuntimeException(failureMessage, e)
       }
     }
+  }
+
+  private[datasources] def executeSinglePartitionTask[T, R](
+      taskIterator: Iterator[T])(execute: T => R): R = {
+    if (!taskIterator.hasNext) {
+      throw new IllegalStateException(
+        "Expected exactly one segment task per Spark partition, but partition was empty")
+    }
+    val task = taskIterator.next()
+    if (taskIterator.hasNext) {
+      throw new IllegalStateException(
+        "Expected exactly one segment task per Spark partition, but partition contained multiple tasks")
+    }
+    execute(task)
   }
 
   def batchFragments(

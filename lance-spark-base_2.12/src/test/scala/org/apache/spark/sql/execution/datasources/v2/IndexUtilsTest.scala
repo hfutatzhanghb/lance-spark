@@ -262,6 +262,37 @@ class IndexUtilsTest {
   }
 
   @Test
+  def executeSinglePartitionTask_executesTheOnlyTask(): Unit = {
+    assertEquals(
+      "segment-7",
+      IndexUtils.executeSinglePartitionTask(Iterator(7))(task => s"segment-$task"))
+  }
+
+  @Test
+  def executeSinglePartitionTask_rejectsEmptyPartitions(): Unit = {
+    val error = assertThrows(
+      classOf[IllegalStateException],
+      () => IndexUtils.executeSinglePartitionTask[Int, String](Iterator.empty)(_.toString))
+
+    assertTrue(error.getMessage.contains("partition was empty"))
+  }
+
+  @Test
+  def executeSinglePartitionTask_rejectsMultipleTasksBeforeExecution(): Unit = {
+    var executed = false
+    val error = assertThrows(
+      classOf[IllegalStateException],
+      () =>
+        IndexUtils.executeSinglePartitionTask(Iterator(1, 2)) { task =>
+          executed = true
+          task.toString
+        })
+
+    assertFalse(executed, "do not build any segment when the partition invariant is violated")
+    assertTrue(error.getMessage.contains("partition contained multiple tasks"))
+  }
+
+  @Test
   def indexSegmentProgress_reportsSuccessfulPartitionsOnce(): Unit = {
     var completed = 0L
     var total = 0L
