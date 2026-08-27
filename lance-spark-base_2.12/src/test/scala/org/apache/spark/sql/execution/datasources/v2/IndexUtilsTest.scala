@@ -266,10 +266,12 @@ class IndexUtilsTest {
     var completed = 0L
     var total = 0L
     val logs = ArrayBuffer.empty[String]
+    val publishedSnapshots = ArrayBuffer.empty[(Long, Long)]
     val progress = new SparkIndexSegmentProgress(
       "idx_text",
       delta => completed += delta,
       delta => total += delta,
+      () => publishedSnapshots += completed -> total,
       message => logs += message,
       (_, _) => ())
 
@@ -284,8 +286,62 @@ class IndexUtilsTest {
       3L,
       completed,
       "a retried or duplicate partition result must not increment progress twice")
+    assertEquals(
+      Seq(0L -> 3L, 1L -> 3L, 2L -> 3L, 3L -> 3L),
+      publishedSnapshots.toSeq,
+      "publish a start snapshot and one snapshot per unique successful partition")
     assertTrue(logs.head.contains("started"))
     assertTrue(logs.last.contains("3/3 segments completed"))
+  }
+
+  @Test
+  def indexSegmentProgress_isolatesPublicationFailures(): Unit = {
+    var completed = 0L
+    var total = 0L
+    var logs = 0
+    var warnings = 0
+    val progress = new SparkIndexSegmentProgress(
+      "idx_text",
+      delta => completed += delta,
+      delta => total += delta,
+      () => throw new RuntimeException("publication failed"),
+      _ => logs += 1,
+      (_, _) => warnings += 1)
+
+    assertProgressDoesNotThrow {
+      progress.start(2)
+    }
+    assertProgressDoesNotThrow {
+      progress.segmentComplete(0)
+    }
+
+    assertEquals(2L, total)
+    assertEquals(1L, completed)
+    assertEquals(2, logs, "publication failures must not suppress progress logging")
+    assertEquals(2, warnings, "each failed publication should be reported once")
+  }
+
+  @Test
+  def indexSegmentProgress_publishesWhenOtherObservationCallbacksFail(): Unit = {
+    var publications = 0
+    var warnings = 0
+    val progress = new SparkIndexSegmentProgress(
+      "idx_text",
+      _ => throw new RuntimeException("metric update failed"),
+      _ => throw new RuntimeException("metric update failed"),
+      () => publications += 1,
+      _ => throw new RuntimeException("log failed"),
+      (_, _) => warnings += 1)
+
+    assertProgressDoesNotThrow {
+      progress.start(2)
+    }
+    assertProgressDoesNotThrow {
+      progress.segmentComplete(0)
+    }
+
+    assertEquals(2, publications, "metric or log failures must not suppress publication attempts")
+    assertEquals(4, warnings)
   }
 
   @Test
@@ -295,6 +351,7 @@ class IndexUtilsTest {
       "idx_text",
       _ => throw new RuntimeException("metric update failed"),
       _ => throw new RuntimeException("metric update failed"),
+      () => throw new RuntimeException("publication failed"),
       _ => throw new RuntimeException("log failed"),
       (_, _) => {
         warnings += 1
@@ -307,7 +364,7 @@ class IndexUtilsTest {
     assertProgressDoesNotThrow {
       progress.segmentComplete(0)
     }
-    assertTrue(warnings >= 4)
+    assertEquals(6, warnings)
   }
 
   @Test

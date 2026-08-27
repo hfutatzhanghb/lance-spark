@@ -23,6 +23,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, GenericInternalRow}
 import org.apache.spark.sql.catalyst.plans.logical.{AddIndexOutputType, LanceNamedArgument}
 import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog}
+import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.LanceArrowUtils
@@ -211,13 +212,25 @@ case class AddIndexExec(
     throw new UnsupportedOperationException(s"Unsupported index type: $indexType")
   }
 
-  private def createIndexSegmentProgress(): SparkIndexSegmentProgress =
+  private def createIndexSegmentProgress(): SparkIndexSegmentProgress = {
+    val completedMetric = metrics(AddIndexExec.INDEX_BUILD_COMPLETED_SEGMENTS)
+    val totalMetric = metrics(AddIndexExec.INDEX_BUILD_TOTAL_SEGMENTS)
+    // runJob invokes its result handler on the DAGScheduler thread, which does not inherit the
+    // command thread's Spark local properties. Capture the SQL execution ID before entering it.
+    val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
+
     new SparkIndexSegmentProgress(
       indexName,
-      completedDelta => metrics(AddIndexExec.INDEX_BUILD_COMPLETED_SEGMENTS).add(completedDelta),
-      totalDelta => metrics(AddIndexExec.INDEX_BUILD_TOTAL_SEGMENTS).add(totalDelta),
+      completedDelta => completedMetric.add(completedDelta),
+      totalDelta => totalMetric.add(totalDelta),
+      () =>
+        SQLMetrics.postDriverMetricUpdates(
+          sparkContext,
+          executionId,
+          Seq(completedMetric, totalMetric)),
       message => logInfo(message),
       (message, cause) => logWarning(message, cause))
+  }
 
   /** Commits an empty (untrained) index on the driver, with an empty fragment bitmap. */
   private def commitEmptyIndex(
@@ -315,6 +328,7 @@ private[datasources] class SparkIndexSegmentProgress(
     indexName: String,
     addCompletedDelta: Long => Unit,
     addTotalDelta: Long => Unit,
+    publishMetricUpdates: () => Unit,
     logStatus: String => Unit,
     logWarningStatus: (String, Throwable) => Unit) {
 
@@ -328,6 +342,7 @@ private[datasources] class SparkIndexSegmentProgress(
       addTotalDelta,
       "update index build total segments metric",
       total.toLong - previousTotal)
+    publishMetrics()
     logProgress(s"Index '$indexName' segment build started (0/$total segments)")
   }
 
@@ -338,6 +353,7 @@ private[datasources] class SparkIndexSegmentProgress(
         addCompletedDelta,
         "update index build completed segments metric",
         1L)
+      publishMetrics()
       logProgress(
         s"Index '$indexName' segment build progress: " +
           s"$completed/${totalSegments.get()} segments completed")
@@ -355,6 +371,12 @@ private[datasources] class SparkIndexSegmentProgress(
   private def logProgress(message: String): Unit = {
     observe("log index build progress") {
       logStatus(message)
+    }
+  }
+
+  private def publishMetrics(): Unit = {
+    observe("publish index build metrics") {
+      publishMetricUpdates()
     }
   }
 

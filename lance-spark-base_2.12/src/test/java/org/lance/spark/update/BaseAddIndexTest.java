@@ -28,12 +28,15 @@ import org.lance.spark.utils.Utils;
 
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.SparkException;
+import org.apache.spark.scheduler.SparkListener;
+import org.apache.spark.scheduler.SparkListenerEvent;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.execution.CommandResultExec;
 import org.apache.spark.sql.execution.metric.SQLMetric;
+import org.apache.spark.sql.execution.ui.SparkListenerDriverAccumUpdates;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.MetadataBuilder;
@@ -57,17 +60,45 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 /** Base test for distributed CREATE INDEX. */
 public abstract class BaseAddIndexTest {
+  private static class DriverMetricSnapshotListener extends SparkListener {
+    private final List<Map<Long, Long>> snapshots = new CopyOnWriteArrayList<>();
+
+    @Override
+    public void onOtherEvent(SparkListenerEvent event) {
+      if (event instanceof SparkListenerDriverAccumUpdates) {
+        SparkListenerDriverAccumUpdates updates = (SparkListenerDriverAccumUpdates) event;
+        Map<Long, Long> snapshot = new HashMap<>();
+        JavaConverters.seqAsJavaList(updates.accumUpdates())
+            .forEach(
+                update ->
+                    snapshot.put(
+                        ((Number) update._1()).longValue(), ((Number) update._2()).longValue()));
+        snapshots.add(snapshot);
+      }
+    }
+
+    List<Map<Long, Long>> snapshotsContaining(long firstMetricId, long secondMetricId) {
+      return snapshots.stream()
+          .filter(
+              snapshot ->
+                  snapshot.containsKey(firstMetricId) && snapshot.containsKey(secondMetricId))
+          .collect(Collectors.toList());
+    }
+  }
+
   protected String catalogName = "lance_test";
   protected String tableName = "create_index_test";
   protected String fullTable = catalogName + ".default." + tableName;
@@ -364,9 +395,11 @@ public abstract class BaseAddIndexTest {
   }
 
   @Test
-  public void testCreateZonemapIndexWithNumSegments() {
+  public void testCreateZonemapIndexWithNumSegments() throws Exception {
     prepareDataset();
 
+    DriverMetricSnapshotListener metricListener = new DriverMetricSnapshotListener();
+    spark.sparkContext().addSparkListener(metricListener);
     Dataset<Row> result =
         spark.sql(
             String.format(
@@ -407,14 +440,51 @@ public abstract class BaseAddIndexTest {
       CommandResultExec commandResult = (CommandResultExec) result.queryExecution().executedPlan();
       Map<String, SQLMetric> progressMetrics =
           JavaConverters.mapAsJavaMap(commandResult.commandPhysicalPlan().metrics());
+      SQLMetric totalMetric = progressMetrics.get("indexBuildTotalSegments");
+      SQLMetric completedMetric = progressMetrics.get("indexBuildCompletedSegments");
       Assertions.assertEquals(
           expectedSegmentCount,
-          progressMetrics.get("indexBuildTotalSegments").value(),
+          totalMetric.value(),
           "Expected progress to report the planned segment count");
       Assertions.assertEquals(
           expectedSegmentCount,
-          progressMetrics.get("indexBuildCompletedSegments").value(),
+          completedMetric.value(),
           "Expected progress to report every successfully built segment");
+
+      spark.sparkContext().listenerBus().waitUntilEmpty(5000);
+      List<Map<Long, Long>> progressSnapshots =
+          metricListener.snapshotsContaining(completedMetric.id(), totalMetric.id());
+      Assertions.assertFalse(
+          progressSnapshots.isEmpty(),
+          "Expected CREATE INDEX driver metrics in SparkListenerDriverAccumUpdates");
+
+      long previousCompleted = -1L;
+      boolean observedStart = false;
+      boolean observedIntermediate = false;
+      boolean observedCompletion = false;
+      for (Map<Long, Long> snapshot : progressSnapshots) {
+        long completed = snapshot.get(completedMetric.id());
+        long total = snapshot.get(totalMetric.id());
+        Assertions.assertEquals(
+            expectedSegmentCount,
+            total,
+            "Every published snapshot should retain the planned segment count");
+        Assertions.assertTrue(
+            completed >= 0 && completed <= total,
+            "Published completed segments must remain within [0, total]");
+        Assertions.assertTrue(
+            completed >= previousCompleted,
+            "Published completed segment snapshots must be monotonic");
+        previousCompleted = completed;
+        observedStart |= completed == 0;
+        observedIntermediate |= completed > 0 && completed < total;
+        observedCompletion |= completed == total;
+      }
+
+      Assertions.assertTrue(observedStart, "Expected an initial 0/total progress snapshot");
+      Assertions.assertTrue(
+          observedIntermediate, "Expected a progress snapshot before every segment completed");
+      Assertions.assertTrue(observedCompletion, "Expected a final total/total progress snapshot");
     } finally {
       lanceDataset.close();
     }
