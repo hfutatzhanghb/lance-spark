@@ -143,6 +143,33 @@ public class LanceArrowStreamScannerTest {
   }
 
   /**
+   * A synthesized {@code _fragid} makes the native-schema check throw after {@code
+   * ExecutorNamespace.acquire}, so cleanup must use the construction {@code catch} path rather than
+   * {@link LanceArrowStreamScanner.LanceArrowStream#close()}. Opening the fragment can also fail
+   * after acquire (for example when the JNI library is unavailable); that is the same catch path.
+   */
+  @Test
+  public void exportClosesExecutorNamespaceWhenSchemaMismatch() {
+    LanceFragmentScannerTest.RecordingNamespace.reset();
+    LanceSparkReadOptions readOptions =
+        LanceSparkReadOptions.builder()
+            .datasetUri(TestUtils.TestTable1Config.datasetUri)
+            .tableId(Collections.singletonList(TestUtils.TestTable1Config.datasetName))
+            .build();
+    LanceInputPartition partition =
+        namespacePartition(readOptions, longSchema("x", LanceConstant.FRAGMENT_ID));
+
+    assertThrows(RuntimeException.class, () -> LanceArrowStreamScanner.export(0, partition));
+
+    assertNull(readOptions.getNamespace());
+    assertEquals(1, LanceFragmentScannerTest.RecordingNamespace.INITIALIZE_CALLS.get());
+    assertEquals(
+        1,
+        LanceFragmentScannerTest.RecordingNamespace.CLOSE_CALLS.get(),
+        "a post-acquire export failure must close the executor namespace");
+  }
+
+  /**
    * When the native scan schema does not match the declared partition schema, export rejects the
    * partition so the caller falls back to the columnar reader. A synthesized {@code _fragid} is not
    * produced by the native scan (native returns fewer columns), while an empty projection makes the
@@ -198,8 +225,13 @@ public class LanceArrowStreamScannerTest {
   }
 
   private static LanceInputPartition namespacePartition(LanceSparkReadOptions readOptions) {
+    return namespacePartition(readOptions, TestUtils.TestTable1Config.schema);
+  }
+
+  private static LanceInputPartition namespacePartition(
+      LanceSparkReadOptions readOptions, StructType schema) {
     return new LanceInputPartition(
-        TestUtils.TestTable1Config.schema,
+        schema,
         0,
         new LanceSplit(Collections.singletonList(0)),
         readOptions,
