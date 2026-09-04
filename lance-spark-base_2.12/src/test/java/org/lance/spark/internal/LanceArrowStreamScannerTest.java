@@ -15,6 +15,7 @@ package org.lance.spark.internal;
 
 import org.lance.spark.LanceConstant;
 import org.lance.spark.LanceRuntime;
+import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.TestUtils;
 import org.lance.spark.read.LanceInputPartition;
 import org.lance.spark.read.LanceSplit;
@@ -33,10 +34,12 @@ import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class LanceArrowStreamScannerTest {
@@ -119,6 +122,26 @@ public class LanceArrowStreamScannerTest {
     handle.close();
   }
 
+  @Test
+  public void exportInitializesAndClosesExecutorNamespace() throws Exception {
+    LanceFragmentScannerTest.RecordingNamespace.reset();
+    LanceSparkReadOptions readOptions =
+        LanceSparkReadOptions.builder()
+            .datasetUri(TestUtils.TestTable1Config.datasetUri)
+            .tableId(Collections.singletonList(TestUtils.TestTable1Config.datasetName))
+            .build();
+    LanceInputPartition partition = namespacePartition(readOptions);
+
+    try (LanceArrowStreamScanner.LanceArrowStream ignored =
+        LanceArrowStreamScanner.export(0, partition)) {
+      assertEquals(1, LanceFragmentScannerTest.RecordingNamespace.INITIALIZE_CALLS.get());
+      assertNotNull(readOptions.getNamespace());
+    }
+
+    assertNull(readOptions.getNamespace());
+    assertEquals(1, LanceFragmentScannerTest.RecordingNamespace.CLOSE_CALLS.get());
+  }
+
   /**
    * When the native scan schema does not match the declared partition schema, export rejects the
    * partition so the caller falls back to the columnar reader. A synthesized {@code _fragid} is not
@@ -172,6 +195,24 @@ public class LanceArrowStreamScannerTest {
         null /* namespaceImpl */,
         null /* namespaceProperties */,
         null /* partitionKeyRow */);
+  }
+
+  private static LanceInputPartition namespacePartition(LanceSparkReadOptions readOptions) {
+    return new LanceInputPartition(
+        TestUtils.TestTable1Config.schema,
+        0,
+        new LanceSplit(Collections.singletonList(0)),
+        readOptions,
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        "arrow-refresh",
+        Collections.emptyMap(),
+        LanceFragmentScannerTest.RecordingNamespace.class.getName(),
+        Collections.singletonMap("location", TestUtils.TestTable1Config.datasetUri),
+        null);
   }
 
   private static LanceInputPartition partitionMatchingNoRows() {

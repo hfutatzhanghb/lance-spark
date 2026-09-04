@@ -262,6 +262,25 @@ public class LanceFragmentScannerTest {
   }
 
   @Test
+  public void testExecutorNamespaceOwnerClosesClient() {
+    RecordingNamespace.reset();
+    LanceInputPartition partition =
+        namespacePartition(
+            TestUtils.TestTable1Config.datasetUri,
+            Collections.singletonList(0),
+            "testExecutorNamespaceOwnerClosesClient",
+            true);
+
+    try (ExecutorNamespace ignored = ExecutorNamespace.acquire(partition)) {
+      assertNotNull(partition.getReadOptions().getNamespace());
+      assertEquals(1, RecordingNamespace.INITIALIZE_CALLS.get());
+    }
+
+    assertNull(partition.getReadOptions().getNamespace());
+    assertEquals(1, RecordingNamespace.CLOSE_CALLS.get());
+  }
+
+  @Test
   public void testPartitionReaderReusesAndClosesExecutorNamespace() throws Exception {
     RecordingNamespace.reset();
     LanceInputPartition partition =

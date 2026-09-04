@@ -13,9 +13,7 @@
  */
 package org.lance.spark.read;
 
-import org.lance.namespace.LanceNamespace;
-import org.lance.spark.LanceRuntime;
-import org.lance.spark.LanceSparkReadOptions;
+import org.lance.spark.internal.ExecutorNamespace;
 import org.lance.spark.internal.LanceFragmentColumnarBatchScanner;
 import org.lance.spark.read.metric.LanceReadMetricsTracker;
 
@@ -32,8 +30,7 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
   private ColumnarBatch currentBatch;
   private final LanceReadMetricsTracker metricsTracker = new LanceReadMetricsTracker();
   private boolean currentScanStatsAdded = false;
-  private boolean executorNamespaceInitialized = false;
-  private LanceNamespace executorNamespace;
+  private ExecutorNamespace executorNamespace;
 
   public LanceColumnarPartitionReader(LanceInputPartition inputPartition) {
     this.inputPartition = inputPartition;
@@ -81,22 +78,8 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
   }
 
   private void initializeExecutorNamespace() {
-    if (executorNamespaceInitialized) {
-      return;
-    }
-    executorNamespaceInitialized = true;
-
-    LanceSparkReadOptions readOptions = inputPartition.getReadOptions();
-    String namespaceImpl = inputPartition.getNamespaceImpl();
-    if (namespaceImpl == null || !readOptions.isExecutorCredentialRefresh()) {
-      return;
-    }
-    if (LanceRuntime.useNamespaceOnWorkers(namespaceImpl)) {
-      executorNamespace =
-          LanceRuntime.getOrCreateNamespace(namespaceImpl, inputPartition.getNamespaceProperties());
-      readOptions.setNamespace(executorNamespace);
-    } else {
-      readOptions.setNamespace(null);
+    if (executorNamespace == null) {
+      executorNamespace = ExecutorNamespace.acquire(inputPartition);
     }
   }
 
@@ -150,18 +133,11 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
   private Throwable closeResources(Throwable primary) {
     LanceFragmentColumnarBatchScanner scannerToClose = fragmentReader;
     fragmentReader = null;
-    LanceNamespace namespaceToClose = executorNamespace;
+    ExecutorNamespace namespaceToClose = executorNamespace;
     executorNamespace = null;
 
-    if (namespaceToClose != null
-        && inputPartition.getReadOptions().getNamespace() == namespaceToClose) {
-      inputPartition.getReadOptions().setNamespace(null);
-    }
-
     primary = closeResource(scannerToClose, primary);
-    if (namespaceToClose instanceof AutoCloseable) {
-      primary = closeResource((AutoCloseable) namespaceToClose, primary);
-    }
+    primary = closeResource(namespaceToClose, primary);
     return primary;
   }
 
