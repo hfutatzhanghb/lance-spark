@@ -18,19 +18,19 @@ import com.fasterxml.jackson.databind.node.ObjectNode
 import org.apache.arrow.c.{ArrowArrayStream, Data}
 import org.apache.arrow.vector.VectorSchemaRoot
 import org.apache.arrow.vector.ipc.ArrowReader
+import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, GenericInternalRow}
 import org.apache.spark.sql.catalyst.plans.logical.{AddIndexOutputType, LanceNamedArgument}
 import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog}
-import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.LanceArrowUtils
 import org.apache.spark.sql.util.LanceSerializeUtil.{decode, encode}
 import org.apache.spark.unsafe.types.UTF8String
 import org.lance.{CommitBuilder, Dataset, Transaction}
-import org.lance.index.{Index, IndexOptions, IndexParams, IndexType}
+import org.lance.index.{Index, IndexBuildProgress, IndexOptions, IndexParams, IndexType}
 import org.lance.index.scalar.{BTreeIndexParams, ScalarIndexParams}
 import org.lance.operation.{CreateIndex => AddIndexOperation}
 import org.lance.schema.{LanceField, LanceSchema}
@@ -39,12 +39,11 @@ import org.lance.spark.arrow.LanceArrowWriter
 import org.lance.spark.utils.{CloseableUtil, FieldPathUtils, Utils}
 import org.lance.spark.write.SingleBatchArrowReader
 
-import java.util.{Collections, Locale, UUID}
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicLong
+import java.util.{Collections, Locale, Optional, UUID}
+import java.util.concurrent.TimeUnit
 
 import scala.collection.JavaConverters._
-import scala.collection.mutable.{ArrayBuffer, PriorityQueue}
+import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
 import scala.reflect.ClassTag
 import scala.util.control.NonFatal
 
@@ -86,7 +85,7 @@ case class AddIndexExec(
   override def output: Seq[Attribute] = AddIndexOutputType.SCHEMA
 
   override lazy val metrics: Map[String, SQLMetric] =
-    AddIndexExec.indexSegmentMetricDefinitions(method, args).map { case (name, description) =>
+    AddIndexExec.indexBuildMetricDefinitions(method, args).map { case (name, description) =>
       name -> SQLMetrics.createMetric(sparkContext, description)
     }.toMap
 
@@ -98,7 +97,8 @@ case class AddIndexExec(
     val btreeBuildMode = IndexUtils.btreeBuildMode(indexType, args)
     val scalarSegmentIndexType = IndexUtils.scalarSegmentIndexType(method)
 
-    val (fragmentWorkloads, canonicalColumns) = {
+    // Plan and build at one pinned version; the commit opens the live dataset.
+    val (fragmentWorkloads, canonicalColumns, buildReadOptions) = {
       val ds = Utils.openDatasetBuilder(readOptions).build()
       try {
         val canonical = columns.map { column =>
@@ -106,10 +106,9 @@ case class AddIndexExec(
           FieldPathUtils.pathByFieldId(ds.getLanceSchema, field.getId)
         }
         (
-          ds.getFragments.asScala
-            .map(fragment => FragmentWorkload(fragment.getId, fragment.metadata().getNumRows))
-            .toList,
-          canonical)
+          IndexUtils.fragmentWorkloads(ds),
+          canonical,
+          IndexUtils.pinVersion(readOptions, ds))
       } finally {
         ds.close()
       }
@@ -173,19 +172,18 @@ case class AddIndexExec(
     val (nsImpl, nsProps, tableId, initialStorageOpts) =
       extractNamespaceInfo(lanceDataset, readOptions)
 
-    // Range-mode BTree uses preprocessed data from Spark and keeps its dedicated path.
     if (btreeBuildMode.contains("range")) {
       val segments = new RangeBasedBTreeIndexJob(
         this.copy(columns = canonicalColumns),
-        readOptions,
+        buildReadOptions,
         fragmentIds.size,
         nsImpl,
         nsProps,
         tableId,
         initialStorageOpts).run()
-      commitIndexSegments(readOptions, canonicalColumns.head, segments)
+      val indexed = commitIndexSegments(readOptions, canonicalColumns.head, segments)
       return Seq(new GenericInternalRow(Array[Any](
-        fragmentIds.size.toLong,
+        indexed.toLong,
         UTF8String.fromString(indexName))))
     }
 
@@ -193,45 +191,30 @@ case class AddIndexExec(
     if (scalarSegmentIndexType.isDefined) {
       val segmentJob = new ScalarSegmentIndexJob(
         this.copy(columns = canonicalColumns),
-        readOptions,
+        buildReadOptions,
         fragmentWorkloads,
         validatedNumSegments,
         nsImpl,
         nsProps,
         tableId,
         initialStorageOpts,
-        createIndexSegmentProgress())
+        indexBuildProgressMetrics())
       val segments = segmentJob.run()
       // Atomic add+remove via Lance core; see commitIndexSegments
-      commitIndexSegments(readOptions, canonicalColumns.head, segments)
+      val indexed = commitIndexSegments(readOptions, canonicalColumns.head, segments)
       return Seq(new GenericInternalRow(Array[Any](
-        fragmentIds.size.toLong,
+        indexed.toLong,
         UTF8String.fromString(indexName))))
     }
 
     throw new UnsupportedOperationException(s"Unsupported index type: $indexType")
   }
 
-  private def createIndexSegmentProgress(): SparkIndexSegmentProgress = {
-    val completedMetric = metrics(AddIndexExec.INDEX_BUILD_COMPLETED_SEGMENTS)
-    val totalMetric = metrics(AddIndexExec.INDEX_BUILD_TOTAL_SEGMENTS)
-    // runJob invokes its result handler on the DAGScheduler thread, which does not inherit the
-    // command thread's Spark local properties. Capture the SQL execution ID before entering it.
-    // Spark tolerates a null ID by skipping listener publication; driver logs remain available.
-    val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
-
-    new SparkIndexSegmentProgress(
-      indexName,
-      completedDelta => completedMetric.add(completedDelta),
-      totalDelta => totalMetric.add(totalDelta),
-      () =>
-        SQLMetrics.postDriverMetricUpdates(
-          sparkContext,
-          executionId,
-          Seq(completedMetric, totalMetric)),
-      message => logInfo(message),
-      (message, cause) => logWarning(message, cause))
-  }
+  private def indexBuildProgressMetrics(): Option[IndexBuildProgressMetrics] =
+    for {
+      progressUpdates <- metrics.get(AddIndexExec.INDEX_BUILD_PROGRESS_UPDATES)
+      completedStages <- metrics.get(AddIndexExec.INDEX_BUILD_COMPLETED_STAGES)
+    } yield IndexBuildProgressMetrics(progressUpdates, completedStages)
 
   /** Commits an empty (untrained) index on the driver, with an empty fragment bitmap. */
   private def commitEmptyIndex(
@@ -263,16 +246,31 @@ case class AddIndexExec(
   // Lance core's commitExistingIndexSegments handles atomic replacement:
   // it finds existing segments whose fragments overlap with incoming ones
   // and removes them in the same CreateIndex transaction.
+  //
+  // Returns the number of fragments the commit actually covers, which is what the command reports.
   private def commitIndexSegments(
       readOptions: LanceSparkReadOptions,
       column: String,
-      segments: Seq[Index]): Unit = {
+      segments: Seq[Index]): Int = {
     val dataset = Utils.openDatasetBuilder(readOptions).build()
     try {
-      dataset.commitExistingIndexSegments(
+      IndexUtils.requireCommittableCoverage(
+        IndexUtils.liveFragmentIds(dataset),
+        segments,
+        indexName)
+      val committed = dataset.commitExistingIndexSegments(
         indexName,
         column,
         segments.toList.asJava)
+      // The commit advances this handle to the manifest it wrote, so both the returned metadata and
+      // the fragment list below describe the committed state rather than the one validated above.
+      IndexUtils
+        .establishedCoverage(
+          segments,
+          committed.asScala.toSeq,
+          IndexUtils.liveFragmentIds(dataset),
+          indexName)
+        .size
     } finally {
       dataset.close()
     }
@@ -299,87 +297,216 @@ case class AddIndexExec(
 }
 
 private[datasources] object AddIndexExec {
-  private[datasources] val INDEX_BUILD_COMPLETED_SEGMENTS = "indexBuildCompletedSegments"
-  private[datasources] val INDEX_BUILD_TOTAL_SEGMENTS = "indexBuildTotalSegments"
+  private[datasources] val INDEX_BUILD_PROGRESS_UPDATES = "indexBuildProgressUpdates"
+  private[datasources] val INDEX_BUILD_COMPLETED_STAGES = "indexBuildCompletedStages"
 
-  private[datasources] def indexSegmentMetricDefinitions(
+  private[datasources] def indexBuildMetricDefinitions(
       method: String,
       args: Seq[LanceNamedArgument]): Map[String, String] = {
-    val usesSegmentBuild =
+    val usesCallbackProgress =
       try {
         val indexType = IndexUtils.buildIndexType(method)
         IndexUtils.extractTrain(args) &&
-        IndexUtils.scalarSegmentIndexType(method).isDefined &&
+        indexType == IndexType.INVERTED &&
+        IndexUtils.scalarSegmentIndexType(method).contains(IndexType.INVERTED) &&
         !IndexUtils.btreeBuildMode(indexType, args).contains("range")
       } catch {
         case NonFatal(_) => false
       }
 
-    if (usesSegmentBuild) {
+    if (usesCallbackProgress) {
       Map(
-        INDEX_BUILD_COMPLETED_SEGMENTS -> "index build completed segments",
-        INDEX_BUILD_TOTAL_SEGMENTS -> "index build total segments")
+        INDEX_BUILD_PROGRESS_UPDATES -> "index build forward progress updates",
+        INDEX_BUILD_COMPLETED_STAGES -> "index build completed stages")
     } else {
       Map.empty
     }
   }
 }
 
-private[datasources] class SparkIndexSegmentProgress(
+final private[datasources] case class IndexBuildProgressMetrics(
+    progressUpdates: SQLMetric,
+    completedStages: SQLMetric) extends Serializable
+
+private[datasources] object SparkIndexBuildProgress extends Logging {
+  private[datasources] val DefaultProgressLogIntervalNanos: Long = TimeUnit.SECONDS.toNanos(5)
+
+  def forCurrentTask(
+      indexName: String,
+      metrics: IndexBuildProgressMetrics): SparkIndexBuildProgress = {
+    val context = TaskContext.get()
+    val partitionId = if (context == null) -1 else context.partitionId()
+    val taskAttemptId = if (context == null) -1L else context.taskAttemptId()
+
+    new SparkIndexBuildProgress(
+      indexName,
+      partitionId,
+      taskAttemptId,
+      () => metrics.progressUpdates.add(1L),
+      () => metrics.completedStages.add(1L),
+      message => logInfo(message),
+      (message, cause) => logWarning(message, cause),
+      () => System.nanoTime(),
+      DefaultProgressLogIntervalNanos)
+  }
+}
+
+/**
+ * Best-effort adapter from Lance's absolute, stage-specific progress callbacks to Spark activity
+ * counters. Work units are intentionally kept in logs instead of being summed across stages.
+ */
+private[datasources] class SparkIndexBuildProgress(
     indexName: String,
-    addCompletedDelta: Long => Unit,
-    addTotalDelta: Long => Unit,
-    publishMetricUpdates: () => Unit,
+    partitionId: Int,
+    taskAttemptId: Long,
+    addProgressUpdate: () => Unit,
+    addCompletedStage: () => Unit,
     logStatus: String => Unit,
-    logWarningStatus: (String, Throwable) => Unit) {
+    logWarningStatus: (String, Throwable) => Unit,
+    nanoTime: () => Long,
+    progressLogIntervalNanos: Long) extends IndexBuildProgress {
 
-  private val totalSegments = new AtomicLong(0L)
-  private val completedSegments = new AtomicLong(0L)
-  private val completedPartitions = ConcurrentHashMap.newKeySet[Integer]()
+  private case class StageState(
+      total: Option[Long],
+      unit: String,
+      startedAtNanos: Long,
+      greatestCompleted: Long,
+      lastProgressLogNanos: Option[Long])
 
-  def start(total: Int): Unit = {
-    val previousTotal = totalSegments.getAndSet(total.toLong)
-    addDelta(
-      addTotalDelta,
-      "update index build total segments metric",
-      total.toLong - previousTotal)
-    publishMetrics()
-    logProgress(s"Index '$indexName' segment build started (0/$total segments)")
-  }
+  private val stages = HashMap.empty[String, StageState]
+  private val completedStages = HashSet.empty[String]
+  // SQLMetric.add performs an unsynchronized read-modify-write. Lance may call this adapter from
+  // multiple native runtime threads, so serialize both metric sinks independently of stage state.
+  private val metricUpdateLock = new Object
 
-  def segmentComplete(partitionId: Int): Unit = {
-    if (completedPartitions.add(Integer.valueOf(partitionId))) {
-      val completed = completedSegments.incrementAndGet()
-      addDelta(
-        addCompletedDelta,
-        "update index build completed segments metric",
-        1L)
-      publishMetrics()
-      logProgress(
-        s"Index '$indexName' segment build progress: " +
-          s"$completed/${totalSegments.get()} segments completed")
+  override def stageStart(stage: String, total: Optional[java.lang.Long], unit: String): Unit = {
+    val now = currentTimeNanos()
+    val normalizedStage = normalize(stage, "unknown")
+    val normalizedUnit = normalize(unit, "unknown")
+    val normalizedTotal = Option(total)
+      .filter(_.isPresent)
+      .map(_.get().longValue())
+
+    synchronized {
+      stages.put(
+        normalizedStage,
+        StageState(normalizedTotal, normalizedUnit, now, 0L, None))
     }
+    logEvent(
+      "start",
+      normalizedStage,
+      0L,
+      normalizedTotal,
+      normalizedUnit,
+      elapsedMillis(now, now))
   }
 
-  private def addDelta(add: Long => Unit, action: String, delta: Long): Unit = {
-    if (delta != 0L) {
-      observe(action) {
-        add(delta)
+  override def stageProgress(stage: String, completed: Long): Unit = {
+    val now = currentTimeNanos()
+    val normalizedStage = normalize(stage, "unknown")
+    var accepted = false
+    var shouldLog = false
+    var snapshot: StageState = null
+
+    synchronized {
+      val current = stages.getOrElse(
+        normalizedStage,
+        StageState(None, "unknown", now, 0L, None))
+      if (completed > current.greatestCompleted) {
+        accepted = true
+        val reachedKnownTotal = current.total.exists(completed >= _)
+        shouldLog = current.lastProgressLogNanos.isEmpty || reachedKnownTotal ||
+          now - current.lastProgressLogNanos.get >= progressLogIntervalNanos
+        snapshot = current.copy(
+          greatestCompleted = completed,
+          lastProgressLogNanos = if (shouldLog) Some(now) else current.lastProgressLogNanos)
+        stages.put(normalizedStage, snapshot)
+      }
+    }
+
+    if (accepted) {
+      updateMetric("update index build forward progress metric") {
+        addProgressUpdate()
+      }
+      if (shouldLog) {
+        logEvent(
+          "progress",
+          normalizedStage,
+          completed,
+          snapshot.total,
+          snapshot.unit,
+          elapsedMillis(snapshot.startedAtNanos, now))
       }
     }
   }
 
-  private def logProgress(message: String): Unit = {
+  override def stageComplete(stage: String): Unit = {
+    val now = currentTimeNanos()
+    val normalizedStage = normalize(stage, "unknown")
+    var firstCompletion = false
+    var snapshot: StageState = null
+
+    synchronized {
+      snapshot = stages.getOrElse(
+        normalizedStage,
+        StageState(None, "unknown", now, 0L, None))
+      stages.put(normalizedStage, snapshot)
+      firstCompletion = completedStages.add(normalizedStage)
+    }
+
+    if (firstCompletion) {
+      updateMetric("update index build completed stages metric") {
+        addCompletedStage()
+      }
+    }
+    logEvent(
+      "complete",
+      normalizedStage,
+      snapshot.greatestCompleted,
+      snapshot.total,
+      snapshot.unit,
+      elapsedMillis(snapshot.startedAtNanos, now))
+  }
+
+  private def currentTimeNanos(): Long = {
+    try {
+      nanoTime()
+    } catch {
+      case NonFatal(e) =>
+        warn("Ignoring failure to read index build progress clock", e)
+        System.nanoTime()
+    }
+  }
+
+  private def elapsedMillis(startedAtNanos: Long, nowNanos: Long): Long =
+    math.max(0L, TimeUnit.NANOSECONDS.toMillis(nowNanos - startedAtNanos))
+
+  private def logEvent(
+      event: String,
+      stage: String,
+      completed: Long,
+      total: Option[Long],
+      unit: String,
+      elapsedMillis: Long): Unit = {
+    val message =
+      s"index_build_stage_$event index=${quote(indexName)} partitionId=$partitionId " +
+        s"taskAttemptId=$taskAttemptId stage=${quote(stage)} completed=$completed " +
+        s"total=${total.map(_.toString).getOrElse("unknown")} unit=${quote(unit)} " +
+        s"elapsedMs=$elapsedMillis"
     observe("log index build progress") {
       logStatus(message)
     }
   }
 
-  private def publishMetrics(): Unit = {
-    observe("publish index build metrics") {
-      publishMetricUpdates()
-    }
+  private def quote(value: String): String = {
+    val escaped = normalize(value, "unknown")
+      .replace("\\", "\\\\")
+      .replace("\"", "\\\"")
+    "\"" + escaped + "\""
   }
+
+  private def normalize(value: String, default: String): String =
+    Option(value).filter(_.nonEmpty).getOrElse(default)
 
   private def observe(action: String)(callback: => Unit): Unit = {
     try {
@@ -389,6 +516,11 @@ private[datasources] class SparkIndexSegmentProgress(
         warn(s"Ignoring failure to $action for index '$indexName'", e)
     }
   }
+
+  private def updateMetric(action: String)(callback: => Unit): Unit =
+    metricUpdateLock.synchronized {
+      observe(action)(callback)
+    }
 
   private def warn(message: String, cause: Throwable): Unit = {
     try {
@@ -428,6 +560,17 @@ class RangeBasedBTreeIndexJob(
 
   private val VALUE_COLUMN_NAME = "value"
 
+  /** Version `readOptions` is pinned to. Throws if the ref is not a version on main. */
+  private def pinnedVersion: Long = {
+    val ref = readOptions.getRef
+    if (ref == null || !ref.isMain || !ref.getVersionNumber.isPresent) {
+      throw new IllegalStateException(
+        "Range-mode BTree builds need read options pinned to a version on main so the scan and the " +
+          "segment stamp describe one snapshot; got a ref that names none")
+    }
+    ref.getVersionNumber.get.longValue()
+  }
+
   def run(): Seq[Index] = {
     if (addIndexExec.columns.size != 1) {
       throw new UnsupportedOperationException(
@@ -449,9 +592,10 @@ class RangeBasedBTreeIndexJob(
     }
     val fullTableName = parts.mkString(".")
 
-    // Read the indexed column with the row id and fragment id metadata columns.
     val fragmentColumn = LanceDataset.FRAGMENT_ID_COLUMN.name
-    val df = session.table(fullTableName)
+    val df = session.read
+      .option(LanceSparkReadOptions.CONFIG_VERSION, pinnedVersion)
+      .table(fullTableName)
     val selectDf = df.select(
       df.col(columns.head).as(VALUE_COLUMN_NAME),
       df.col(LanceDataset.ROW_ID_COLUMN.name),
@@ -468,6 +612,7 @@ class RangeBasedBTreeIndexJob(
 
     val indexBuilder = RangeBTreeIndexBuilder(
       encode(readOptions),
+      addIndexExec.indexName,
       columns,
       zoneSize,
       nsImpl,
@@ -497,6 +642,7 @@ class RangeBasedBTreeIndexJob(
  * This class is serialized and sent to executors to build the index for a specific range of data.
  *
  * @param encodedReadOptions      Serialized configuration for Lance dataset access.
+ * @param indexName               Name of the logical index the segment will belong to.
  * @param columns                 The names of the columns to be indexed.
  * @param zoneSize                Optional size of zones within the B-tree index.
  * @param namespaceImpl           Optional implementation class for namespace operations, used for credential vending.
@@ -507,6 +653,7 @@ class RangeBasedBTreeIndexJob(
  */
 case class RangeBTreeIndexBuilder(
     encodedReadOptions: String,
+    indexName: String,
     columns: List[String],
     zoneSize: Option[Long],
     namespaceImpl: Option[String],
@@ -570,10 +717,7 @@ case class RangeBTreeIndexBuilder(
 
       Data.exportArrayStream(allocator, reader, stream)
 
-      // Build an uncommitted BTree segment for this fragment group from the
-      // pre-sorted data. No index name or UUID is set: Lance generates the
-      // segment UUID, and the fragment ids declare the segment's coverage so
-      // the per-partition segments stay disjoint.
+      // replace is for Lance's name check, and the driver commit still publishes.
       val btreeParamsBuilder = BTreeIndexParams.builder()
       if (zoneSize.isDefined) {
         btreeParamsBuilder.zoneSize(zoneSize.get)
@@ -584,7 +728,8 @@ case class RangeBTreeIndexBuilder(
 
       val indexOptions = IndexOptions
         .builder(columns.asJava, IndexType.BTREE, indexParams)
-        .replace(false)
+        .withIndexName(indexName)
+        .replace(true)
         .withFragmentIds(fragmentIds.toList.asJava)
         .withPreprocessedData(stream)
         .build()
@@ -614,7 +759,7 @@ class ScalarSegmentIndexJob(
     nsProps: Option[Map[String, String]],
     tableId: Option[List[String]],
     initialStorageOpts: Option[Map[String, String]],
-    progress: SparkIndexSegmentProgress) {
+    progressMetrics: Option[IndexBuildProgressMetrics]) {
 
   def run(): Seq[Index] = {
     val indexType = IndexUtils.scalarSegmentIndexType(addIndexExec.method).getOrElse {
@@ -632,6 +777,7 @@ class ScalarSegmentIndexJob(
     val tasks = fragmentBatches.map { batch =>
       ScalarSegmentIndexTask(
         encodedReadOptions,
+        addIndexExec.indexName,
         columns,
         addIndexExec.method,
         argsJson,
@@ -639,15 +785,15 @@ class ScalarSegmentIndexJob(
         nsImpl,
         nsProps,
         tableId,
-        initialStorageOpts)
+        initialStorageOpts,
+        progressMetrics)
     }.toSeq
 
     IndexUtils.runSegmentTasks(
       addIndexExec.session.sparkContext,
       tasks,
       s"${indexType.name()} index build failed. Uncommitted segments are not " +
-        "visible to readers and will not affect query correctness.",
-      progress)(_.execute())
+        "visible to readers and will not affect query correctness.")(_.execute())
   }
 }
 
@@ -658,6 +804,7 @@ final private[v2] case class FragmentWorkload(fragmentId: Integer, numRows: Long
  */
 case class ScalarSegmentIndexTask(
     encodedReadOptions: String,
+    indexName: String,
     columns: List[String],
     method: String,
     argsJson: String,
@@ -665,7 +812,8 @@ case class ScalarSegmentIndexTask(
     namespaceImpl: Option[String],
     namespaceProperties: Option[Map[String, String]],
     tableId: Option[List[String]],
-    initialStorageOptions: Option[Map[String, String]]) extends Serializable {
+    initialStorageOptions: Option[Map[String, String]],
+    progressMetrics: Option[IndexBuildProgressMetrics]) extends Serializable {
 
   def execute(): String = {
     val readOptions = decode[LanceSparkReadOptions](encodedReadOptions)
@@ -680,8 +828,9 @@ case class ScalarSegmentIndexTask(
 
     val indexOptions = IndexOptions
       .builder(java.util.Arrays.asList(columns: _*), indexType, params)
+      .withIndexName(indexName)
       .withFragmentIds(fragmentIds.asJava)
-      .replace(false)
+      .replace(true)
       .build()
 
     val dataset = Utils.openDatasetBuilder(readOptions)
@@ -693,7 +842,13 @@ case class ScalarSegmentIndexTask(
       .build()
 
     try {
-      encode(dataset.createIndex(indexOptions))
+      val createdIndex = progressMetrics match {
+        case Some(metrics) =>
+          val progress = SparkIndexBuildProgress.forCurrentTask(indexName, metrics)
+          dataset.createIndex(indexOptions, progress)
+        case None => dataset.createIndex(indexOptions)
+      }
+      encode(createdIndex)
     } finally {
       dataset.close()
     }
@@ -753,6 +908,89 @@ object IndexUtils extends Logging {
     methodToIndexTypes
       .get(method.toLowerCase(Locale.ROOT))
       .filter(scalarSegmentIndexTypes.contains)
+
+  /** Pins `readOptions` to the version `dataset` is open at. */
+  def pinVersion(
+      readOptions: LanceSparkReadOptions,
+      dataset: Dataset): LanceSparkReadOptions =
+    readOptions.withRef(Utils.pinOpenedRef(dataset, readOptions.getRef))
+
+  /**
+   * Fragment ids and live row counts of `dataset`, in manifest order.
+   *
+   * Reads the primitive fragment-statistics view rather than [[Dataset#getFragments]], which
+   * materializes a Java object per fragment and per data file. Both commands enumerate fragments on
+   * the driver, once to plan and once to check the commit, so on a large table that difference is
+   * the bulk of planning cost.
+   */
+  def fragmentWorkloads(dataset: Dataset): List[FragmentWorkload] = {
+    val stats = dataset.getFragmentStatistics
+    val ids = stats.getIds
+    val rowCounts = stats.getRowCounts
+    List.tabulate(ids.length)(index =>
+      FragmentWorkload(Integer.valueOf(ids(index)), rowCounts(index)))
+  }
+
+  /** Fragment ids live in `dataset`. See [[fragmentWorkloads]] for why this avoids getFragments. */
+  def liveFragmentIds(dataset: Dataset): Set[Int] =
+    dataset.getFragmentStatistics.getIds.toSet
+
+  /** Fragment ids the given segments declare coverage of. */
+  def declaredCoverage(segments: Seq[Index]): Set[Int] =
+    segments.iterator
+      .flatMap(_.fragments().orElse(Collections.emptyList[Integer]()).asScala)
+      .map(_.intValue)
+      .toSet
+
+  /**
+   * Refuses a segment set that declares coverage but intersects no live fragment. Partial loss is
+   * accepted: fragments can be retired by compaction or deletion during the build, and the segments
+   * covering what remains are still correct. [[establishedCoverage]] reports what was actually
+   * committed.
+   */
+  def requireCommittableCoverage(
+      liveFragmentIds: Set[Int],
+      segments: Seq[Index],
+      indexName: String): Unit = {
+    val declared = declaredCoverage(segments)
+    if (declared.nonEmpty && declared.intersect(liveFragmentIds).isEmpty) {
+      throw new IllegalStateException(
+        s"Index '$indexName' build raced a concurrent operation: every fragment it covers " +
+          s"(${describeFragmentIds(declared)}) was retired while the build ran, so the segments " +
+          "would cover nothing. No index change was committed; re-run the command.")
+    }
+  }
+
+  /**
+   * Committed fragment ids from the segments this build produced, intersected with what is still
+   * live. Only segments whose UUID matches `builtSegments` are counted; pre-existing survivors are
+   * not this command's coverage.
+   */
+  def establishedCoverage(
+      builtSegments: Seq[Index],
+      committedSegments: Seq[Index],
+      liveFragmentIds: Set[Int],
+      indexName: String): Set[Int] = {
+    val builtUuids = builtSegments.map(_.uuid).toSet
+    val established =
+      declaredCoverage(committedSegments.filter(segment => builtUuids.contains(segment.uuid)))
+        .intersect(liveFragmentIds)
+    val uncovered = declaredCoverage(builtSegments).diff(established)
+    if (uncovered.nonEmpty) {
+      logWarning(
+        s"Index '$indexName' build raced a concurrent operation: fragments " +
+          s"${describeFragmentIds(uncovered)} are not covered by this commit, because they were " +
+          "retired or because their indexed field was rewritten while the build ran. The segments " +
+          "for the remaining fragments are committed; re-run the command to cover them.")
+    }
+    established
+  }
+
+  private def describeFragmentIds(ids: Set[Int]): String = {
+    val ordered = ids.toSeq.sorted
+    val shown = ordered.take(10).mkString(", ")
+    if (ordered.size > 10) s"$shown, ... (${ordered.size} total)" else shown
+  }
 
   def resolveIndexField(
       schema: LanceSchema,
@@ -852,48 +1090,37 @@ object IndexUtils extends Logging {
   def runSegmentTasks[T <: Serializable: ClassTag](
       sc: org.apache.spark.SparkContext,
       tasks: Seq[T],
-      failureMessage: String,
-      progress: SparkIndexSegmentProgress)(execute: T => String): Seq[Index] = {
+      failureMessage: String)(execute: T => String): Seq[Index] = {
     if (tasks.isEmpty) {
       Seq.empty
     } else {
       try {
-        val encodedResults = new Array[String](tasks.size)
-        // parallelize with one slice per task must produce exactly one task in every partition.
-        // Validate that invariant inside the job so empty or multi-task partitions fail clearly.
-        val taskRdd = sc.parallelize(tasks, tasks.size)
-        progress.start(tasks.size)
-        // Spark invokes the result handler on the driver once for each successful output
-        // partition. This preserves the independent-segment retry/speculation semantics while
-        // exposing live progress before the full job result is available.
-        sc.runJob(
-          taskRdd,
-          (taskIterator: Iterator[T]) => executeSinglePartitionTask(taskIterator)(execute),
-          (partitionId: Int, encoded: String) => {
-            encodedResults(partitionId) = encoded
-            progress.segmentComplete(partitionId)
-          })
-        encodedResults.map(encoded => decode[Index](encoded)).toSeq
+        sc.parallelize(tasks, tasks.size)
+          .map(execute)
+          .collect()
+          .map(encoded => decode[Index](encoded))
+          .toSeq
       } catch {
         case e: Exception => throw new RuntimeException(failureMessage, e)
       }
     }
   }
 
-  private[datasources] def executeSinglePartitionTask[T, R](
-      taskIterator: Iterator[T])(execute: T => R): R = {
-    if (!taskIterator.hasNext) {
-      throw new IllegalStateException(
-        "Expected exactly one segment task per Spark partition, but partition was empty")
-    }
-    val task = taskIterator.next()
-    if (taskIterator.hasNext) {
-      throw new IllegalStateException(
-        "Expected exactly one segment task per Spark partition, but partition contained multiple tasks")
-    }
-    execute(task)
-  }
-
+  /**
+   * Splits `fragments` into `numSegments` batches, each a contiguous run of fragment ids, chosen so
+   * that the heaviest batch is as light as any contiguous split allows.
+   *
+   * Contiguity is not cosmetic. Lance's compaction planner only groups fragments that are covered by
+   * the identical set of index segments, so batches whose fragment ids interleave leave every
+   * adjacent pair of fragments in a different group and make OPTIMIZE a no-op for the whole table.
+   * It does cost some balance. `[10, 9, 8, 7]` into two batches is 19/15 here, where the previous
+   * least-loaded-first assignment reached 17/17 by interleaving. Optimal among contiguous splits is
+   * the guarantee, not optimal overall.
+   *
+   * Assignment is deterministic: the same fragments and segment count always produce the same
+   * batches, whatever order `fragments` arrives in. Every batch holds at least one fragment, so the
+   * result always has exactly `segmentCount` entries.
+   */
   def batchFragments(
       fragments: List[FragmentWorkload],
       numSegments: Option[Int],
@@ -915,35 +1142,125 @@ object IndexUtils extends Logging {
       case None => math.max(1, math.min(fragmentCount, defaultParallelism))
     }
 
-    final class SegmentBatch(val index: Int) {
-      val fragmentIds: ArrayBuffer[Integer] = ArrayBuffer.empty
-      var numRows: Long = 0L
+    val ordered = fragments.sortBy(_.fragmentId.intValue)
+    // Prefix sums drive the search. addExact rejects a workload that cannot be summed rather than
+    // balancing against a wrapped total.
+    val rowsUpTo = new Array[Long](fragmentCount + 1)
+    ordered.iterator.zipWithIndex.foreach { case (fragment, index) =>
+      rowsUpTo(index + 1) = Math.addExact(rowsUpTo(index), fragment.numRows)
+    }
 
-      def add(fragment: FragmentWorkload): Unit = {
-        numRows = Math.addExact(numRows, fragment.numRows)
-        fragmentIds += fragment.fragmentId
+    var offset = 0
+    balancedRunLengths(rowsUpTo, segmentCount).map { length =>
+      val batch = ordered.slice(offset, offset + length).map(_.fragmentId)
+      offset += length
+      batch
+    }
+  }
+
+  /**
+   * Lengths of exactly `segmentCount` contiguous runs over `rowsUpTo`, minimising the heaviest run.
+   *
+   * The smallest row budget a contiguous packing can respect is found by binary search, which is
+   * exact rather than approximate: for a fixed budget, extending each run as far as it will go uses
+   * the fewest runs, so the smallest feasible budget is the optimal maximum. The floor of the search
+   * is the widest single fragment, below which no packing exists.
+   *
+   * Packing at that budget can use fewer runs than were asked for, which would cost parallelism, so
+   * runs are divided until the count is reached. Which run gets divided does not matter: every run
+   * already fits the budget, so both halves of any split fit it too, and the budget is minimal, so
+   * the heaviest run cannot fall below it either.
+   */
+  private def balancedRunLengths(rowsUpTo: Array[Long], segmentCount: Int): Seq[Int] = {
+    val fragmentCount = rowsUpTo.length - 1
+    def rowsOf(start: Int, length: Int): Long = rowsUpTo(start + length) - rowsUpTo(start)
+
+    var widestFragment = 0L
+    var index = 0
+    while (index < fragmentCount) {
+      widestFragment = math.max(widestFragment, rowsOf(index, 1))
+      index += 1
+    }
+
+    var low = widestFragment
+    var high = rowsUpTo(fragmentCount)
+    while (low < high) {
+      val budget = low + (high - low) / 2
+      if (runsWithin(rowsUpTo, budget) <= segmentCount) high = budget else low = budget + 1
+    }
+
+    // runLengthAt(start) is the length of the run beginning at `start`, and 0 elsewhere.
+    val runLengthAt = new Array[Int](fragmentCount)
+    var runCount = 0
+    var start = 0
+    while (start < fragmentCount) {
+      var length = 1
+      while (start + length < fragmentCount && rowsOf(start, length + 1) <= low) {
+        length += 1
+      }
+      runLengthAt(start) = length
+      runCount += 1
+      start += length
+    }
+
+    // Divide from the left until the count is reached. Splitting the heaviest run first would be no
+    // better, since the budget already bounds every run.
+    var splitAt = 0
+    while (runCount < segmentCount && splitAt < fragmentCount) {
+      val length = runLengthAt(splitAt)
+      if (length > 1) {
+        val cut = balancePoint(rowsUpTo, splitAt, length)
+        runLengthAt(splitAt) = cut
+        runLengthAt(splitAt + cut) = length - cut
+        runCount += 1
+      } else {
+        splitAt += length
       }
     }
 
-    val segmentOrdering: Ordering[SegmentBatch] =
-      Ordering
-        .by[SegmentBatch, (Long, Int, Int)](segment =>
-          (segment.numRows, segment.fragmentIds.size, segment.index))
-        .reverse
-
-    val segments = PriorityQueue.empty[SegmentBatch](segmentOrdering)
-    (0 until segmentCount).foreach(index => segments.enqueue(new SegmentBatch(index)))
-
-    val sortedFragments = fragments.sortBy(fragment => (-fragment.numRows, fragment.fragmentId))
-    sortedFragments.foreach { fragment =>
-      val segment = segments.dequeue()
-      segment.add(fragment)
-      segments.enqueue(segment)
+    val runs = ArrayBuffer.empty[Int]
+    var cursor = 0
+    while (cursor < fragmentCount) {
+      val length = runLengthAt(cursor)
+      runs += length
+      cursor += length
     }
+    runs.toList
+  }
 
-    segments.toSeq
-      .sortBy(_.index)
-      .map(segment => segment.fragmentIds.sortBy(_.intValue()).toList)
+  /**
+   * Fewest contiguous runs that keep every run's row count within `budget`.
+   *
+   * A fragment wider than `budget` still forms a run of its own, so callers must not search below
+   * the widest fragment or the count would understate what the budget can actually hold.
+   */
+  private def runsWithin(rowsUpTo: Array[Long], budget: Long): Int = {
+    val fragmentCount = rowsUpTo.length - 1
+    var runs = 0
+    var start = 0
+    while (start < fragmentCount) {
+      var length = 1
+      while (start + length < fragmentCount &&
+        rowsUpTo(start + length + 1) - rowsUpTo(start) <= budget) {
+        length += 1
+      }
+      runs += 1
+      start += length
+    }
+    runs
+  }
+
+  /** Where to cut a run of `length` fragments so the two halves are as even as possible. */
+  private def balancePoint(rowsUpTo: Array[Long], start: Int, length: Int): Int = {
+    val total = rowsUpTo(start + length) - rowsUpTo(start)
+    def leftOf(at: Int): Long = rowsUpTo(start + at) - rowsUpTo(start)
+    def heavierHalf(at: Int): Long = math.max(leftOf(at), total - leftOf(at))
+
+    var cut = 1
+    while (cut < length - 1 && leftOf(cut) < total - leftOf(cut)) {
+      cut += 1
+    }
+    if (cut > 1 && heavierHalf(cut - 1) < heavierHalf(cut)) cut - 1 else cut
   }
 
 }

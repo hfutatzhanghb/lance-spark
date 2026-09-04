@@ -17,8 +17,13 @@ import org.apache.spark.sql.catalyst.plans.logical.LanceNamedArgument
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.function.Executable
-import org.lance.index.IndexType
+import org.lance.index.{Index, IndexType}
 
+import java.util.Optional
+import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
+
+import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 
 /**
@@ -29,10 +34,42 @@ import scala.collection.mutable.ArrayBuffer
  */
 class IndexUtilsTest {
 
+  /** An index segment carrying only the metadata these helpers read. */
+  private def segment(
+      fragmentIds: Option[Seq[Int]],
+      indexDetails: Option[Array[Byte]] = None): Index = {
+    val builder = Index
+      .builder()
+      .uuid(java.util.UUID.randomUUID())
+      .name("idx_id")
+      .indexType(IndexType.INVERTED)
+    fragmentIds.foreach(ids =>
+      builder.fragments(ids.map(java.lang.Integer.valueOf).asJava))
+    indexDetails.foreach(builder.indexDetails)
+    builder.build()
+  }
+
+  private def coveringSegment(fragmentIds: Int*): Index = segment(Some(fragmentIds))
+
   private def fragmentWorkloads(rows: Long*): List[FragmentWorkload] =
     rows.zipWithIndex.map { case (rowCount, fragmentId) =>
       FragmentWorkload(java.lang.Integer.valueOf(fragmentId), rowCount)
     }.toList
+
+  /**
+   * Asserts the batches partition the fragments into contiguous runs of the id order.
+   *
+   * Concatenating the batches in order and getting an ascending id sequence back is exactly that
+   * property: any partition whose concatenation is sorted consists of consecutive slices.
+   */
+  private def assertContiguousBatches(batches: Seq[List[Integer]]): Unit = {
+    val flattened = batches.flatten.map(_.intValue)
+    assertEquals(
+      flattened.sorted,
+      flattened,
+      s"batches must partition the fragments in id order, got $batches")
+    batches.foreach(batch => assertFalse(batch.isEmpty, s"no batch may be empty, got $batches"))
+  }
 
   // ── extractTrain ──────────────────────────────────────────────────────────
 
@@ -231,15 +268,60 @@ class IndexUtilsTest {
     assertEquals(Seq.empty, IndexUtils.batchFragments(Nil, None, 4))
   }
 
+  /**
+   * Interleaved coverage makes Lance's compaction planner treat every adjacent fragment pair as
+   * ungroupable, so OPTIMIZE stops coalescing the table entirely. Batches must be contiguous runs.
+   */
+  @Test
+  def batchFragments_producesContiguousRuns(): Unit = {
+    Seq(
+      fragmentWorkloads(1, 1, 1, 1, 1, 1),
+      fragmentWorkloads(100, 1, 1, 1),
+      fragmentWorkloads(1, 1, 1, 100),
+      fragmentWorkloads(5, 9, 2, 7, 3, 8, 1, 6),
+      fragmentWorkloads(0, 0, 0, 0, 0)).foreach { fragments =>
+      (1 to fragments.size).foreach { segments =>
+        val batches = IndexUtils.batchFragments(fragments, Some(segments), 4)
+        assertEquals(
+          segments,
+          batches.size,
+          s"expected $segments batches for ${fragments.size} fragments, got $batches")
+        assertContiguousBatches(batches)
+        assertEquals(
+          fragments.map(_.fragmentId),
+          batches.flatten,
+          "every fragment must be assigned exactly once")
+      }
+    }
+  }
+
   @Test
   def batchFragments_balancesRowsDeterministically(): Unit = {
     val fragments = fragmentWorkloads(80, 50, 30, 20)
+    // Splitting after fragment 0 gives 80 / 100; the contiguous alternative gives 130 / 50.
     val expected = Seq(
-      List(java.lang.Integer.valueOf(0), java.lang.Integer.valueOf(3)),
-      List(java.lang.Integer.valueOf(1), java.lang.Integer.valueOf(2)))
+      List(java.lang.Integer.valueOf(0)),
+      List(
+        java.lang.Integer.valueOf(1),
+        java.lang.Integer.valueOf(2),
+        java.lang.Integer.valueOf(3)))
 
     assertEquals(expected, IndexUtils.batchFragments(fragments, Some(2), 4))
     assertEquals(expected, IndexUtils.batchFragments(fragments.reverse, Some(2), 4))
+  }
+
+  /** A single dominant fragment must not collapse the requested parallelism. */
+  @Test
+  def batchFragments_keepsRequestedParallelismUnderSkew(): Unit = {
+    val batches = IndexUtils.batchFragments(fragmentWorkloads(100, 1, 1, 1), Some(4), 4)
+
+    assertEquals(
+      Seq(
+        List(java.lang.Integer.valueOf(0)),
+        List(java.lang.Integer.valueOf(1)),
+        List(java.lang.Integer.valueOf(2)),
+        List(java.lang.Integer.valueOf(3))),
+      batches)
   }
 
   @Test
@@ -248,10 +330,96 @@ class IndexUtilsTest {
 
     assertEquals(
       Seq(
-        List(java.lang.Integer.valueOf(0), java.lang.Integer.valueOf(3)),
+        List(java.lang.Integer.valueOf(0)),
         List(java.lang.Integer.valueOf(1)),
-        List(java.lang.Integer.valueOf(2))),
+        List(java.lang.Integer.valueOf(2), java.lang.Integer.valueOf(3))),
       IndexUtils.batchFragments(fragments, Some(3), 4))
+  }
+
+  /** Fragment ids are not necessarily dense or zero-based once a table has been compacted. */
+  @Test
+  def batchFragments_keepsSparseFragmentIdsContiguousByPosition(): Unit = {
+    val fragments = List(
+      FragmentWorkload(java.lang.Integer.valueOf(17), 10L),
+      FragmentWorkload(java.lang.Integer.valueOf(4), 10L),
+      FragmentWorkload(java.lang.Integer.valueOf(9), 10L),
+      FragmentWorkload(java.lang.Integer.valueOf(31), 10L))
+
+    assertEquals(
+      Seq(
+        List(java.lang.Integer.valueOf(4), java.lang.Integer.valueOf(9)),
+        List(java.lang.Integer.valueOf(17), java.lang.Integer.valueOf(31))),
+      IndexUtils.batchFragments(fragments, Some(2), 4))
+  }
+
+  private def workloads(batches: Seq[List[Integer]], rows: Seq[Long]): Seq[Long] =
+    batches.map(_.map(id => rows(id.intValue)).sum)
+
+  /** Smallest achievable heaviest batch over all contiguous partitions into `segmentCount` runs. */
+  private def optimalHeaviestBatch(rows: Seq[Long], segmentCount: Int): Long = {
+    def best(from: Int, runs: Int): Long =
+      if (runs == 1) {
+        rows.drop(from).sum
+      } else {
+        (from until rows.size - runs + 1).map { cut =>
+          math.max(rows.slice(from, cut + 1).sum, best(cut + 1, runs - 1))
+        }.min
+      }
+    best(0, segmentCount)
+  }
+
+  /**
+   * The heaviest batch has to be as light as a contiguous partition allows. This workload is the
+   * counter-example that sank an earlier prefix-crossing heuristic: it cut after the three
+   * indivisible leading fragments had already overshot their even shares, leaving one batch of 162
+   * where 95 is forced by fragment 0 alone.
+   */
+  @Test
+  def batchFragments_minimisesTheHeaviestBatch(): Unit = {
+    val rows = Seq(95L, 93L, 89L, 8L, 1L, 4L, 74L, 88L, 38L)
+    val fragments = rows.zipWithIndex.map { case (count, fragmentId) =>
+      FragmentWorkload(java.lang.Integer.valueOf(fragmentId), count)
+    }.toList
+
+    val batches = IndexUtils.batchFragments(fragments, Some(6), 1)
+
+    assertEquals(6, batches.size)
+    assertContiguousBatches(batches)
+    assertEquals(
+      95L,
+      workloads(batches, rows).max,
+      s"expected the optimal heaviest batch, got ${workloads(batches, rows)}")
+  }
+
+  /**
+   * Optimality is checked against every contiguous partition rather than against a fixed expected
+   * split, so the property is pinned instead of one of its consequences.
+   */
+  @Test
+  def batchFragments_matchesTheOptimalContiguousPartition(): Unit = {
+    val workloadShapes = Seq(
+      Seq(95L, 93L, 89L, 8L, 1L, 4L, 74L, 88L, 38L),
+      Seq(100L, 1L, 1L, 1L, 1L, 1L),
+      Seq(1L, 1L, 1L, 1L, 1L, 100L),
+      Seq(5L, 9L, 2L, 7L, 3L, 8L, 1L, 6L),
+      Seq(7L, 7L, 7L, 7L, 7L, 7L, 7L),
+      Seq(50L, 1L, 50L, 1L, 50L, 1L, 50L),
+      Seq(0L, 0L, 5L, 0L, 0L))
+
+    workloadShapes.foreach { rows =>
+      val fragments = rows.zipWithIndex.map { case (count, fragmentId) =>
+        FragmentWorkload(java.lang.Integer.valueOf(fragmentId), count)
+      }.toList
+      (1 to rows.size).foreach { segmentCount =>
+        val batches = IndexUtils.batchFragments(fragments, Some(segmentCount), 1)
+        assertEquals(segmentCount, batches.size, s"$rows into $segmentCount")
+        assertContiguousBatches(batches)
+        assertEquals(
+          optimalHeaviestBatch(rows, segmentCount),
+          workloads(batches, rows).max,
+          s"$rows into $segmentCount batches: got ${workloads(batches, rows)}")
+      }
+    }
   }
 
   @Test
@@ -262,167 +430,370 @@ class IndexUtilsTest {
   }
 
   @Test
-  def executeSinglePartitionTask_executesTheOnlyTask(): Unit = {
-    assertEquals(
-      "segment-7",
-      IndexUtils.executeSinglePartitionTask(Iterator(7))(task => s"segment-$task"))
-  }
-
-  @Test
-  def executeSinglePartitionTask_rejectsEmptyPartitions(): Unit = {
-    val error = assertThrows(
-      classOf[IllegalStateException],
-      () => IndexUtils.executeSinglePartitionTask[Int, String](Iterator.empty)(_.toString))
-
-    assertTrue(error.getMessage.contains("partition was empty"))
-  }
-
-  @Test
-  def executeSinglePartitionTask_rejectsMultipleTasksBeforeExecution(): Unit = {
-    var executed = false
-    val error = assertThrows(
-      classOf[IllegalStateException],
-      () =>
-        IndexUtils.executeSinglePartitionTask(Iterator(1, 2)) { task =>
-          executed = true
-          task.toString
-        })
-
-    assertFalse(executed, "do not build any segment when the partition invariant is violated")
-    assertTrue(error.getMessage.contains("partition contained multiple tasks"))
-  }
-
-  @Test
-  def indexSegmentProgress_reportsSuccessfulPartitionsOnce(): Unit = {
-    var completed = 0L
-    var total = 0L
+  def indexBuildProgress_reportsKnownAndUnknownStageQuantities(): Unit = {
+    var progressUpdates = 0L
+    var completedStages = 0L
+    var now = 0L
     val logs = ArrayBuffer.empty[String]
-    val publishedSnapshots = ArrayBuffer.empty[(Long, Long)]
-    val progress = new SparkIndexSegmentProgress(
-      "idx_text",
-      delta => completed += delta,
-      delta => total += delta,
-      () => publishedSnapshots += completed -> total,
-      message => logs += message,
-      (_, _) => ())
+    val progress = testProgress(
+      () => progressUpdates += 1L,
+      () => completedStages += 1L,
+      logs += _,
+      () => now,
+      progressLogIntervalNanos = 100L)
 
-    progress.start(3)
-    progress.segmentComplete(2)
-    progress.segmentComplete(0)
-    progress.segmentComplete(2)
-    progress.segmentComplete(1)
+    progress.stageStart("load_data", Optional.of(java.lang.Long.valueOf(10L)), "rows")
+    now = 1L
+    progress.stageProgress("load_data", 1L)
+    now = 2L
+    progress.stageProgress("load_data", 10L)
+    progress.stageComplete("load_data")
+    progress.stageStart("write_metadata", Optional.empty[java.lang.Long](), "files")
+    now = 3L
+    progress.stageProgress("write_metadata", Long.MaxValue)
+    progress.stageComplete("write_metadata")
 
-    assertEquals(3L, total)
+    assertEquals(3L, progressUpdates)
+    assertEquals(2L, completedStages)
+    assertTrue(logs.exists(_.contains("stage=\"load_data\" completed=10 total=10 unit=\"rows\"")))
+    assertTrue(
+      logs.exists(
+        _.contains(
+          "stage=\"write_metadata\" completed=" + Long.MaxValue +
+            " total=unknown unit=\"files\"")))
+  }
+
+  @Test
+  def indexBuildProgress_ignoresRepeatedRegressingAndZeroValues(): Unit = {
+    var updates = 0L
+    val logs = ArrayBuffer.empty[String]
+    val progress = testProgress(
+      () => updates += 1L,
+      () => (),
+      logs += _,
+      () => 0L,
+      progressLogIntervalNanos = 0L)
+
+    progress.stageStart("tokenize_docs", Optional.of(java.lang.Long.valueOf(9L)), "rows")
+    Seq(0L, 4L, 4L, 3L, 9L, 8L).foreach(progress.stageProgress("tokenize_docs", _))
+
+    assertEquals(2L, updates)
+    assertEquals(2, logs.count(_.contains("index_build_stage_progress")))
+  }
+
+  @Test
+  def indexBuildProgress_rateLimitsLogsButAlwaysLogsKnownTotalAndCompletion(): Unit = {
+    var updates = 0L
+    var now = 0L
+    val logs = ArrayBuffer.empty[String]
+    val progress = testProgress(
+      () => updates += 1L,
+      () => (),
+      logs += _,
+      () => now,
+      progressLogIntervalNanos = 100L)
+
+    progress.stageStart("copy_partitions", Optional.of(java.lang.Long.valueOf(4L)), "partitions")
+    now = 1L
+    progress.stageProgress("copy_partitions", 1L)
+    now = 2L
+    progress.stageProgress("copy_partitions", 2L)
+    now = 101L
+    progress.stageProgress("copy_partitions", 3L)
+    now = 102L
+    progress.stageProgress("copy_partitions", 4L)
+    now = 103L
+    progress.stageComplete("copy_partitions")
+
+    assertEquals(4L, updates, "rate limiting must never suppress metric activity")
+    assertEquals(3, logs.count(_.contains("index_build_stage_progress")))
+    assertTrue(logs.exists(_.contains("completed=4 total=4")), "known total must be logged")
+    assertTrue(logs.last.contains("index_build_stage_complete"))
+    assertTrue(logs.last.contains("completed=4 total=4"))
+  }
+
+  @Test
+  def indexBuildProgress_countsStageCompletionOnceButLogsEveryCallback(): Unit = {
+    var completions = 0L
+    val logs = ArrayBuffer.empty[String]
+    val progress = testProgress(
+      () => (),
+      () => completions += 1L,
+      logs += _,
+      () => 0L,
+      progressLogIntervalNanos = 0L)
+
+    progress.stageStart("write_metadata", Optional.empty[java.lang.Long](), "files")
+    progress.stageComplete("write_metadata")
+    progress.stageComplete("write_metadata")
+
+    assertEquals(1L, completions)
+    assertEquals(2, logs.count(_.contains("index_build_stage_complete")))
+  }
+
+  @Test
+  def indexBuildProgress_isThreadSafeAcrossConcurrentCallbacks(): Unit = {
+    val stageCount = 32
+    val updates = new java.util.concurrent.atomic.AtomicLong(0L)
+    val completions = new java.util.concurrent.atomic.AtomicLong(0L)
+    val activeMetricCallbacks = new AtomicInteger(0)
+    val overlappingMetricCallbacks = new AtomicInteger(0)
+    val logs = new ConcurrentLinkedQueue[String]()
+    val recordMetric: java.util.concurrent.atomic.AtomicLong => Unit = counter => {
+      if (activeMetricCallbacks.incrementAndGet() > 1) {
+        overlappingMetricCallbacks.incrementAndGet()
+      }
+      try {
+        Thread.sleep(2L)
+        counter.incrementAndGet()
+      } finally {
+        activeMetricCallbacks.decrementAndGet()
+      }
+    }
+    val progress = testProgress(
+      () => recordMetric(updates),
+      () => recordMetric(completions),
+      logs.add,
+      () => 0L,
+      progressLogIntervalNanos = Long.MaxValue)
+    (0 until stageCount).foreach { stage =>
+      progress.stageStart(s"stage_$stage", Optional.empty[java.lang.Long](), "items")
+    }
+
+    val executor = Executors.newFixedThreadPool(8)
+    val start = new CountDownLatch(1)
+    try {
+      val futures = (0 until stageCount).map { stage =>
+        executor.submit(new Runnable {
+          override def run(): Unit = {
+            start.await(10, TimeUnit.SECONDS)
+            progress.stageProgress(s"stage_$stage", 1L)
+            progress.stageComplete(s"stage_$stage")
+            progress.stageComplete(s"stage_$stage")
+          }
+        })
+      }
+      start.countDown()
+      futures.foreach(_.get(10, TimeUnit.SECONDS))
+    } finally {
+      executor.shutdownNow()
+    }
+
+    assertEquals(stageCount.toLong, updates.get())
+    assertEquals(stageCount.toLong, completions.get())
     assertEquals(
-      3L,
-      completed,
-      "a retried or duplicate partition result must not increment progress twice")
+      0,
+      overlappingMetricCallbacks.get(),
+      "the adapter must serialize SQLMetric updates from concurrent native callbacks")
     assertEquals(
-      Seq(0L -> 3L, 1L -> 3L, 2L -> 3L, 3L -> 3L),
-      publishedSnapshots.toSeq,
-      "publish a start snapshot and one snapshot per unique successful partition")
-    assertTrue(logs.head.contains("started"))
-    assertTrue(logs.last.contains("3/3 segments completed"))
+      stageCount * 2,
+      logs.asScala.count(_.contains("index_build_stage_complete")))
   }
 
   @Test
-  def indexSegmentProgress_isolatesPublicationFailures(): Unit = {
-    var completed = 0L
-    var total = 0L
-    var logs = 0
-    var warnings = 0
-    val progress = new SparkIndexSegmentProgress(
-      "idx_text",
-      delta => completed += delta,
-      delta => total += delta,
-      () => throw new RuntimeException("publication failed"),
-      _ => logs += 1,
-      (_, _) => warnings += 1)
+  def indexBuildProgress_logsTaskAttemptIdentityAndEscapesFields(): Unit = {
+    val logs = ArrayBuffer.empty[String]
+    val progress = testProgress(
+      () => (),
+      () => (),
+      logs += _,
+      () => 0L,
+      progressLogIntervalNanos = 0L,
+      indexName = "idx_\"text",
+      partitionId = 7,
+      taskAttemptId = 42L)
 
-    assertProgressDoesNotThrow {
-      progress.start(2)
-    }
-    assertProgressDoesNotThrow {
-      progress.segmentComplete(0)
-    }
+    progress.stageStart("load\\data", Optional.empty[java.lang.Long](), "row\"s")
 
-    assertEquals(2L, total)
-    assertEquals(1L, completed)
-    assertEquals(2, logs, "publication failures must not suppress progress logging")
-    assertEquals(2, warnings, "each failed publication should be reported once")
+    assertTrue(logs.head.contains("index=\"idx_\\\"text\""))
+    assertTrue(logs.head.contains("partitionId=7 taskAttemptId=42"))
+    assertTrue(logs.head.contains("stage=\"load\\\\data\""))
+    assertTrue(logs.head.contains("unit=\"row\\\"s\""))
+    assertTrue(logs.head.contains("elapsedMs=0"))
   }
 
   @Test
-  def indexSegmentProgress_publishesWhenOtherObservationCallbacksFail(): Unit = {
-    var publications = 0
+  def indexBuildProgress_isolatesMetricLoggingAndWarningFailures(): Unit = {
     var warnings = 0
-    val progress = new SparkIndexSegmentProgress(
+    val progress = new SparkIndexBuildProgress(
       "idx_text",
-      _ => throw new RuntimeException("metric update failed"),
-      _ => throw new RuntimeException("metric update failed"),
-      () => publications += 1,
-      _ => throw new RuntimeException("log failed"),
-      (_, _) => warnings += 1)
-
-    assertProgressDoesNotThrow {
-      progress.start(2)
-    }
-    assertProgressDoesNotThrow {
-      progress.segmentComplete(0)
-    }
-
-    assertEquals(2, publications, "metric or log failures must not suppress publication attempts")
-    assertEquals(4, warnings)
-  }
-
-  @Test
-  def indexSegmentProgress_ignoresObservationFailures(): Unit = {
-    var warnings = 0
-    val progress = new SparkIndexSegmentProgress(
-      "idx_text",
-      _ => throw new RuntimeException("metric update failed"),
-      _ => throw new RuntimeException("metric update failed"),
-      () => throw new RuntimeException("publication failed"),
+      3,
+      9L,
+      () => throw new RuntimeException("progress metric failed"),
+      () => throw new RuntimeException("stage metric failed"),
       _ => throw new RuntimeException("log failed"),
       (_, _) => {
         warnings += 1
-        throw new RuntimeException("warn failed")
-      })
+        throw new RuntimeException("warning failed")
+      },
+      () => 0L,
+      0L)
 
     assertProgressDoesNotThrow {
-      progress.start(2)
+      progress.stageStart("load_data", Optional.empty[java.lang.Long](), "rows")
+      progress.stageProgress("load_data", 1L)
+      progress.stageComplete("load_data")
     }
-    assertProgressDoesNotThrow {
-      progress.segmentComplete(0)
-    }
-    assertEquals(6, warnings)
+    assertEquals(5, warnings)
   }
 
   @Test
-  def indexSegmentMetricDefinitions_onlyReportsForEagerSegmentBuilds(): Unit = {
-    val ftsMetricNames =
-      AddIndexExec.indexSegmentMetricDefinitions("fts", Seq.empty).keySet
+  def indexBuildMetricDefinitions_onlyReportsForEagerFtsBuilds(): Unit = {
+    val expected = Set(
+      AddIndexExec.INDEX_BUILD_PROGRESS_UPDATES,
+      AddIndexExec.INDEX_BUILD_COMPLETED_STAGES)
 
-    assertEquals(
-      Set(
-        AddIndexExec.INDEX_BUILD_COMPLETED_SEGMENTS,
-        AddIndexExec.INDEX_BUILD_TOTAL_SEGMENTS),
-      ftsMetricNames)
-    assertFalse(AddIndexExec.indexSegmentMetricDefinitions("BTREE", Seq.empty).isEmpty)
+    assertEquals(expected, AddIndexExec.indexBuildMetricDefinitions("fts", Seq.empty).keySet)
+    assertEquals(expected, AddIndexExec.indexBuildMetricDefinitions("INVERTED", Seq.empty).keySet)
+    assertTrue(AddIndexExec.indexBuildMetricDefinitions("btree", Seq.empty).isEmpty)
+    assertTrue(AddIndexExec.indexBuildMetricDefinitions("zonemap", Seq.empty).isEmpty)
     assertTrue(
-      AddIndexExec.indexSegmentMetricDefinitions(
-        "btree",
-        Seq(LanceNamedArgument("build_mode", "range"))).isEmpty)
-    assertTrue(
-      AddIndexExec.indexSegmentMetricDefinitions(
+      AddIndexExec.indexBuildMetricDefinitions(
         "fts",
         Seq(LanceNamedArgument("train", java.lang.Boolean.FALSE))).isEmpty)
-    assertTrue(AddIndexExec.indexSegmentMetricDefinitions("ivf_pq", Seq.empty).isEmpty)
+    assertTrue(AddIndexExec.indexBuildMetricDefinitions("ivf_pq", Seq.empty).isEmpty)
   }
+
+  private def testProgress(
+      addProgressUpdate: () => Unit,
+      addCompletedStage: () => Unit,
+      logStatus: String => Unit,
+      nanoTime: () => Long,
+      progressLogIntervalNanos: Long,
+      indexName: String = "idx_text",
+      partitionId: Int = 2,
+      taskAttemptId: Long = 11L): SparkIndexBuildProgress =
+    new SparkIndexBuildProgress(
+      indexName,
+      partitionId,
+      taskAttemptId,
+      addProgressUpdate,
+      addCompletedStage,
+      logStatus,
+      (_, _) => (),
+      nanoTime,
+      progressLogIntervalNanos)
 
   private def assertProgressDoesNotThrow(callback: => Unit): Unit = {
     assertDoesNotThrow(new Executable {
       override def execute(): Unit = callback
     })
   }
+
+  @Test
+  def declaredCoverage_unionsSegmentBitmaps(): Unit = {
+    assertEquals(
+      Set(0, 1, 4),
+      IndexUtils.declaredCoverage(Seq(coveringSegment(0, 1), coveringSegment(4))))
+  }
+
+  @Test
+  def declaredCoverage_treatsAbsentBitmapAsNoCoverage(): Unit = {
+    assertEquals(Set(2), IndexUtils.declaredCoverage(Seq(segment(None), coveringSegment(2))))
+    assertEquals(Set.empty[Int], IndexUtils.declaredCoverage(Seq.empty))
+  }
+
+  /** A segment keeping its identity but reporting narrower coverage, as a pruned commit returns. */
+  private def prunedTo(built: Index, fragmentIds: Seq[Int]): Index =
+    Index
+      .builder()
+      .uuid(built.uuid)
+      .name(built.name)
+      .indexType(built.indexType)
+      .fragments(fragmentIds.map(java.lang.Integer.valueOf).asJava)
+      .build()
+
+  @Test
+  def requireCommittableCoverage_acceptsCoverageThatSurvives(): Unit = {
+    IndexUtils.requireCommittableCoverage(Set(1, 5), Seq(coveringSegment(0, 1)), "idx_id")
+  }
+
+  @Test
+  def requireCommittableCoverage_acceptsSegmentsThatDeclareNothing(): Unit = {
+    IndexUtils.requireCommittableCoverage(Set(1), Seq(segment(None)), "idx_id")
+    IndexUtils.requireCommittableCoverage(Set.empty[Int], Seq.empty, "idx_id")
+  }
+
+  @Test
+  def requireCommittableCoverage_refusesASetThatWouldCoverNothing(): Unit = {
+    val error = assertThrows(
+      classOf[IllegalStateException],
+      () => IndexUtils.requireCommittableCoverage(Set(5), Seq(coveringSegment(0, 7)), "idx_id"))
+
+    assertTrue(error.getMessage.contains("idx_id"), error.getMessage)
+    assertTrue(error.getMessage.contains("0, 7"), error.getMessage)
+    assertTrue(error.getMessage.contains("re-run"), error.getMessage)
+  }
+
+  @Test
+  def requireCommittableCoverage_summarizesLargeRetiredSets(): Unit = {
+    val error = assertThrows(
+      classOf[IllegalStateException],
+      () =>
+        IndexUtils.requireCommittableCoverage(
+          Set.empty[Int],
+          Seq(coveringSegment(0 to 20: _*)),
+          "idx_id"))
+
+    assertTrue(error.getMessage.contains("21 total"), error.getMessage)
+  }
+
+  @Test
+  def establishedCoverage_reportsWhatTheCommitReturned(): Unit = {
+    val built = Seq(coveringSegment(0, 1), coveringSegment(2))
+
+    assertEquals(
+      Set(0, 1, 2),
+      IndexUtils.establishedCoverage(built, built, Set(0, 1, 2), "idx_id"))
+  }
+
+  @Test
+  def establishedCoverage_followsAPrunedCommitEvenWhileEveryFragmentIsLive(): Unit = {
+    val built = coveringSegment(0, 1)
+
+    assertEquals(
+      Set(0),
+      IndexUtils.establishedCoverage(
+        Seq(built),
+        Seq(prunedTo(built, Seq(0))),
+        Set(0, 1),
+        "idx_id"))
+  }
+
+  @Test
+  def establishedCoverage_excludesFragmentsRetiredByTheCommit(): Unit = {
+    val built = coveringSegment(0, 1)
+
+    assertEquals(
+      Set(1),
+      IndexUtils.establishedCoverage(Seq(built), Seq(built), Set(1, 5), "idx_id"))
+  }
+
+  @Test
+  def establishedCoverage_countsOnlyTheSegmentsThisBuildProduced(): Unit = {
+    val built = coveringSegment(2)
+    val survivor = coveringSegment(0, 1)
+
+    assertEquals(
+      Set(2),
+      IndexUtils.establishedCoverage(
+        Seq(built),
+        Seq(survivor, built),
+        Set(0, 1, 2),
+        "idx_id"))
+  }
+
+  @Test
+  def establishedCoverage_isEmptyWhenNothingOfThisBuildSurvived(): Unit = {
+    val built = coveringSegment(0)
+
+    assertEquals(
+      Set.empty[Int],
+      IndexUtils.establishedCoverage(
+        Seq(built),
+        Seq(prunedTo(built, Seq.empty)),
+        Set(0),
+        "idx_id"))
+  }
+
 }

@@ -38,6 +38,8 @@ The following index methods are supported:
 
 The `CREATE INDEX` command supports options via the `WITH` clause to control index creation. These options are specific to the chosen index method.
 
+Option names are case-insensitive: `WITH (TRAIN = false)` and `WITH (train = false)` are the same option.
+
 ### Common Options
 
 These options apply to all index methods:
@@ -53,7 +55,12 @@ The distributed build used by `zonemap`, `bitmap`, `label_list`, `ngram`, `bloom
 
 | Option         | Type    | Description                                                                                                                                                                                                                        |
 |----------------|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `num_segments` | Integer | Target number of parallel build tasks (upper bound; clamped to fragment count when larger). Fragments are assigned by row count to balance estimated task workloads. Defaults to `min(fragment_count, spark.default.parallelism)`. |
+| `num_segments` | Integer | Number of parallel build tasks, and so of index segments created (clamped to fragment count when larger). Each task takes a contiguous run of fragments, and the runs are chosen so the heaviest task is as light as any contiguous split allows. Defaults to `min(fragment_count, spark.default.parallelism)`. |
+
+Contiguous coverage matters beyond parallelism: [OPTIMIZE](./optimize.md) can only group fragments
+that the identical set of index segments covers. Interleaved segments leave it nothing to coalesce at
+all, while contiguous ones let it coalesce within each segment's run. A segment boundary is still a
+boundary, so `num_segments` also bounds how far compaction can get.
 
 ### ZoneMap Options
 
@@ -284,12 +291,24 @@ The `CREATE INDEX` command returns the following information about the operation
 | `fragments_indexed` | Long   | The number of fragments that were indexed. |
 | `index_name`        | String | The name of the created index.         |
 
-For eager distributed segment builds, Lance Spark reports driver-side progress through Spark SQL
-metrics displayed as `index build completed segments` and `index build total segments`. Their
-executed-plan metric keys are `indexBuildCompletedSegments` and `indexBuildTotalSegments`,
-respectively. The driver also logs progress as successful segment tasks return. Task retries and
-speculative attempts are counted once per successful Spark partition. Progress reporting is
-informational and does not change the command output or the atomic segment commit.
+For eager distributed `fts` / `inverted` builds, Lance Spark exposes Lance's internal build activity
+through two Spark SQL metrics:
+
+| Executed-plan key | Spark UI description | Meaning |
+|-------------------|----------------------|---------|
+| `indexBuildProgressUpdates` | `index build forward progress updates` | Strictly increasing `stageProgress` observations from Lance. |
+| `indexBuildCompletedStages` | `index build completed stages` | Distinct Lance stages completed by successful Spark task attempts. |
+
+These are activity counters, not completed row counts or percentages. Lance stages can measure
+different units, such as rows, partitions, or files, and some stages do not know their total in
+advance. Executor logs retain the exact stage-specific values and include the index name, Spark
+partition ID, task-attempt ID, stage, completed value, optional total, unit, and elapsed time.
+
+Executor heartbeats can make metric changes visible while a task is still building its segment.
+Retries or speculative attempts can appear transiently in the live UI; final metric values use
+Spark's successful-attempt accumulator semantics. An unchanged counter means only that Lance has
+reported no new callback activity—it does not prove that the native operation is stuck. Progress
+reporting is informational and does not change command output or atomic segment publication.
 
 ## When to Use an Index
 
