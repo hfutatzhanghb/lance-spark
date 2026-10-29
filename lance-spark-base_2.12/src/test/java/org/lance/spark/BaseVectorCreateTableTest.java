@@ -163,7 +163,8 @@ public abstract class BaseVectorCreateTableTest {
     assertFalse(properties.contains("values.arrow.fixed-size-list.size"));
 
     List<Row> dimension =
-        spark.sql("SHOW TBLPROPERTIES " + fullName + " ('embedding.arrow.fixed-size-list.size')")
+        spark
+            .sql("SHOW TBLPROPERTIES " + fullName + " ('embedding.arrow.fixed-size-list.size')")
             .collectAsList();
     assertEquals("756", dimension.get(0).getString(1));
   }
