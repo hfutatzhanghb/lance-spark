@@ -406,6 +406,7 @@ public class LanceDataset
     props.put("location", readOptions.getDatasetUri());
     // FixedSizeList dimensions live in the schema and may not be present in dataset config.
     // Expose them as SQL properties while keeping Spark's array<float/double> column types.
+    // The actual schema takes precedence over config, including after SET/UNSET TBLPROPERTIES.
     for (StructField field : sparkSchema.fields()) {
       if (VectorUtils.shouldBeFixedSizeList(field.dataType(), field.metadata())) {
         props.put(

@@ -142,7 +142,7 @@ public abstract class BaseVectorCreateTableTest {
             + "'embedding_double.arrow.fixed-size-list.size' = '64')");
 
     // Reload from disk: dimensions must come from the schema, not CREATE TABLE's options.
-    spark.catalog().refreshTable(fullName);
+    spark.sql("REFRESH TABLE " + fullName);
     spark.sql("ALTER TABLE " + fullName + " SET TBLPROPERTIES ('team' = 'search')");
     List<Row> description = spark.sql("DESCRIBE EXTENDED " + fullName).collectAsList();
     Row embedding =
@@ -167,6 +167,22 @@ public abstract class BaseVectorCreateTableTest {
             .sql("SHOW TBLPROPERTIES " + fullName + " ('embedding.arrow.fixed-size-list.size')")
             .collectAsList();
     assertEquals("756", dimension.get(0).getString(1));
+
+    // Config changes do not resize the vector or hide the dimension derived from its schema.
+    for (String change :
+        new String[] {
+          "SET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '128')",
+          "UNSET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size')"
+        }) {
+      spark.sql("ALTER TABLE " + fullName + " " + change);
+      spark.sql("REFRESH TABLE " + fullName);
+      List<Row> updatedDimension =
+          spark
+              .sql("SHOW TBLPROPERTIES " + fullName + " ('embedding.arrow.fixed-size-list.size')")
+              .collectAsList();
+      assertEquals("756", updatedDimension.get(0).getString(1), change);
+      assertFixedSizeListMetadata(spark.table(fullName).schema(), "embedding", 756);
+    }
   }
 
   @Test
