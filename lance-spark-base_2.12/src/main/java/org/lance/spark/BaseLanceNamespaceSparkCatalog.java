@@ -43,6 +43,7 @@ import org.lance.spark.function.LanceMultiMatchFunction;
 import org.lance.spark.function.LancePhraseFunction;
 import org.lance.spark.sharding.SparkLanceShardingUtils;
 import org.lance.spark.utils.Optional;
+import org.lance.spark.utils.SchemaConverter;
 import org.lance.spark.utils.Utils;
 import org.lance.spark.write.StagedCommit;
 import org.lance.spark.write.StagedCommitOptions;
@@ -1022,6 +1023,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
     ResolvedTable resolved = resolveIdentifier(ident);
 
     try (Dataset dataset = Utils.openDatasetBuilder(resolved.readOptions).build()) {
+      rejectSchemaPropertiesForExistingColumns(dataset.getSchema(), propsToSet);
       // Dataset.updateConfig uses replace semantics (overwrites entire config),
       // so we must read-merge-write to preserve existing properties.
       Map<String, String> merged = new HashMap<>(dataset.getConfig());
@@ -1034,6 +1036,35 @@ public abstract class BaseLanceNamespaceSparkCatalog
     }
 
     return loadTable(ident);
+  }
+
+  /**
+   * Reject schema and encoding properties that name a column already stored in the dataset.
+   * Properties for columns that are not in the schema yet stay allowed, so a later ADD COLUMNS can
+   * read durable config such as {@code content.lance.encoding}. The check runs before any config
+   * commit, so one protected key rejects the whole request.
+   */
+  private static void rejectSchemaPropertiesForExistingColumns(
+      Schema arrowSchema, Map<String, String> propsToSet) {
+    if (propsToSet.isEmpty()) {
+      return;
+    }
+    String[] fieldNames = LanceArrowUtils.fromArrowSchema(arrowSchema).fieldNames();
+    Set<String> existingColumns = new HashSet<>(Arrays.asList(fieldNames));
+    for (String property : propsToSet.keySet()) {
+      String column = SchemaConverter.schemaPropertyColumn(property);
+      if (column != null && existingColumns.contains(column)) {
+        throw new UnsupportedOperationException(
+            "Property '"
+                + property
+                + "' can only be set at table creation because column '"
+                + column
+                + "' already exists. Configure that column with CREATE TABLE."
+                + " A property for a column that is not in the schema yet can still be set"
+                + " before ADD COLUMNS. UNSET TBLPROPERTIES can remove legacy config without"
+                + " changing the stored schema.");
+      }
+    }
   }
 
   @Override

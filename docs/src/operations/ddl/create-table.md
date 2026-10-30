@@ -501,8 +501,11 @@ They are silently ignored if present:
 
 ### ALTER TABLE Limitation
 
-`ALTER TABLE ... SET TBLPROPERTIES` does **not** mutate Arrow field metadata or change the encoding
-of previously written data. Compression properties are applied only when the table is created.
+Compression properties for a column already in the table are applied only when that table
+is created. Setting them through `ALTER TABLE ... SET TBLPROPERTIES` is rejected, even for
+the current value. The same keys can be set for a column that does not exist yet, so a later
+`ADD COLUMNS` can use them. `UNSET TBLPROPERTIES` can remove legacy config entries without
+changing stored field metadata.
 
 ### Example
 
