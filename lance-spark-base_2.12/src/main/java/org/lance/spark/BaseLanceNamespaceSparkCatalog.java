@@ -38,12 +38,14 @@ import org.lance.namespace.model.RenameTableRequest;
 import org.lance.operation.UpdateConfig;
 import org.lance.operation.UpdateMap;
 import org.lance.schema.LanceField;
+import org.lance.schema.LanceSchema;
 import org.lance.spark.function.LanceBucketFunction;
 import org.lance.spark.function.LanceFragmentIdWithDefaultFunction;
 import org.lance.spark.function.LanceMatchFunction;
 import org.lance.spark.function.LanceMultiMatchFunction;
 import org.lance.spark.function.LancePhraseFunction;
 import org.lance.spark.sharding.SparkLanceShardingUtils;
+import org.lance.spark.utils.FieldPathUtils;
 import org.lance.spark.utils.Optional;
 import org.lance.spark.utils.SchemaConverter;
 import org.lance.spark.utils.Utils;
@@ -1064,18 +1066,20 @@ public abstract class BaseLanceNamespaceSparkCatalog
         resolved.describeResponse != null
             && Boolean.TRUE.equals(resolved.describeResponse.getManagedVersioning());
     try (Dataset dataset = Utils.openDatasetBuilder(resolved.readOptions).build()) {
-      List<String> paths = resolveColumnsToDrop(dataset, columnsToDrop);
-      if (paths.isEmpty()) {
+      DropResolution resolution = resolveColumnsToDrop(dataset, columnsToDrop);
+      if (resolution.paths.isEmpty()) {
         return loadTable(ident);
       }
       Map<String, String> originalConfig = new HashMap<>(dataset.getConfig());
-      Map<String, String> updatedConfig = configWithoutDroppedColumns(originalConfig, paths);
+      Map<String, String> updatedConfig =
+          configWithoutDroppedColumns(
+              originalConfig, dataset.getLanceSchema(), resolution.removedFieldIds);
       boolean configChanged = !updatedConfig.equals(originalConfig);
       if (configChanged) {
         updateDatasetConfig(dataset, updatedConfig, managedVersioning, resolved.tableIdList);
       }
       try {
-        dataset.dropColumns(paths);
+        dataset.dropColumns(resolution.paths);
       } catch (RuntimeException dropFailure) {
         restoreConfigAfterFailedDrop(
             dataset,
@@ -1090,9 +1094,10 @@ public abstract class BaseLanceNamespaceSparkCatalog
     return loadTable(ident);
   }
 
-  private static List<String> resolveColumnsToDrop(
+  private static DropResolution resolveColumnsToDrop(
       Dataset dataset, List<TableChange.DeleteColumn> columnsToDrop) {
-    List<LanceField> topLevel = dataset.getLanceSchema().fields();
+    LanceSchema schema = dataset.getLanceSchema();
+    List<LanceField> topLevel = schema.fields();
     List<String> paths = new ArrayList<>();
     Map<Integer, String> removedFieldIds = new HashMap<>();
     Set<String> droppedTopLevel = new HashSet<>();
@@ -1102,7 +1107,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
         throw new IllegalArgumentException("DROP COLUMN requires a column name.");
       }
       LanceField field = findField(topLevel, parts, 0);
-      String path = String.join(".", parts);
+      String path = FieldPathUtils.canonicalPath(Arrays.asList(parts));
       if (field == null) {
         if (Boolean.TRUE.equals(drop.ifExists())) {
           continue;
@@ -1113,13 +1118,13 @@ public abstract class BaseLanceNamespaceSparkCatalog
         continue;
       }
       paths.add(path);
-      collectFieldIds(field, path, removedFieldIds);
+      collectFieldIds(field, Arrays.asList(parts), removedFieldIds);
       if (parts.length == 1) {
         droppedTopLevel.add(parts[0]);
       }
     }
     if (paths.isEmpty()) {
-      return paths;
+      return new DropResolution(paths, new HashSet<>(removedFieldIds.keySet()));
     }
     boolean keepsAColumn = false;
     for (LanceField field : topLevel) {
@@ -1132,7 +1137,17 @@ public abstract class BaseLanceNamespaceSparkCatalog
       throw new UnsupportedOperationException(DROP_ALL_COLUMNS_MESSAGE);
     }
     rejectIndexedDrop(dataset.getIndexes(), removedFieldIds);
-    return paths;
+    return new DropResolution(paths, new HashSet<>(removedFieldIds.keySet()));
+  }
+
+  private static final class DropResolution {
+    private final List<String> paths;
+    private final Set<Integer> removedFieldIds;
+
+    private DropResolution(List<String> paths, Set<Integer> removedFieldIds) {
+      this.paths = paths;
+      this.removedFieldIds = removedFieldIds;
+    }
   }
 
   private static LanceField findField(List<LanceField> fields, String[] parts, int index) {
@@ -1150,11 +1165,30 @@ public abstract class BaseLanceNamespaceSparkCatalog
   }
 
   private static void collectFieldIds(
-      LanceField field, String path, Map<Integer, String> fieldIds) {
+      LanceField field, List<String> parts, Map<Integer, String> fieldIds) {
+    String path = FieldPathUtils.canonicalPath(parts);
     fieldIds.put(field.getId(), path);
-    for (LanceField child : field.getChildren()) {
-      collectFieldIds(child, path + "." + child.getName(), fieldIds);
+    if (isUnenforcedPrimaryKey(field)) {
+      throw new UnsupportedOperationException(
+          "Cannot drop column '"
+              + path
+              + "' because it is part of the unenforced primary key. "
+              + "The primary key cannot be changed or removed once set.");
     }
+    for (LanceField child : field.getChildren()) {
+      List<String> childParts = new ArrayList<>(parts);
+      childParts.add(child.getName());
+      collectFieldIds(child, childParts, fieldIds);
+    }
+  }
+
+  private static boolean isUnenforcedPrimaryKey(LanceField field) {
+    if (field.isUnenforcedPrimaryKey()) {
+      return true;
+    }
+    Map<String, String> metadata = field.getMetadata();
+    return metadata != null
+        && "true".equalsIgnoreCase(metadata.get("lance-schema:unenforced-primary-key"));
   }
 
   private static void rejectIndexedDrop(List<Index> indexes, Map<Integer, String> removedFieldIds) {
@@ -1192,24 +1226,24 @@ public abstract class BaseLanceNamespaceSparkCatalog
   }
 
   private static Map<String, String> configWithoutDroppedColumns(
-      Map<String, String> config, List<String> droppedPaths) {
+      Map<String, String> config, LanceSchema schema, Set<Integer> removedFieldIds) {
     Map<String, String> updated = new HashMap<>(config);
-    updated
-        .keySet()
-        .removeIf(
-            key -> {
-              String column = SchemaConverter.schemaPropertyColumn(key);
-              if (column == null) {
-                return false;
-              }
-              for (String dropped : droppedPaths) {
-                if (column.equals(dropped) || column.startsWith(dropped + ".")) {
-                  return true;
-                }
-              }
-              return false;
-            });
+    updated.keySet().removeIf(key -> configKeyTargetsRemovedField(schema, removedFieldIds, key));
     return updated;
+  }
+
+  private static boolean configKeyTargetsRemovedField(
+      LanceSchema schema, Set<Integer> removedFieldIds, String key) {
+    String column = SchemaConverter.schemaPropertyColumn(key);
+    if (column == null) {
+      return false;
+    }
+    try {
+      LanceField field = FieldPathUtils.resolveField(schema, column);
+      return removedFieldIds.contains(field.getId());
+    } catch (IllegalArgumentException notAStoredField) {
+      return false;
+    }
   }
 
   private void restoreConfigAfterFailedDrop(

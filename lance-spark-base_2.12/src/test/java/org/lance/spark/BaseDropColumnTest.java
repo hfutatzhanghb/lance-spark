@@ -19,6 +19,7 @@ import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
+import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -170,6 +171,53 @@ public abstract class BaseDropColumnTest {
     assertEquals(List.of("id", "region"), fieldNames("indexed"));
     assertEquals(before, config("indexed"));
     assertTrue(indexNames("indexed").contains("region_idx"));
+  }
+
+  @Test
+  public void testDropQuotedFieldDoesNotRemoveNestedPath() throws Exception {
+    createTable("collision", "id INT, s STRUCT<`a.b`: INT, a: STRUCT<b: INT>, keep: INT>");
+    spark.sql(
+        "INSERT INTO "
+            + full("collision")
+            + " VALUES (1, named_struct('a.b', 11, 'a', named_struct('b', 22), 'keep', 33))");
+    setProperties(
+        "collision",
+        "'s.`a.b`.lance.compression' = 'zstd', 's.a.b.lance.compression' = 'lz4', 'team' = 'search'");
+    spark.sql("ALTER TABLE " + full("collision") + " DROP COLUMN s.`a.b`");
+    refresh("collision");
+
+    Row row =
+        spark
+            .sql("SELECT s.a.b AS nested, s.keep AS keep FROM " + full("collision"))
+            .collectAsList()
+            .get(0);
+    assertEquals(22, row.getInt(0));
+    assertEquals(33, row.getInt(1));
+    StructType struct = (StructType) spark.table(full("collision")).schema().apply("s").dataType();
+    assertFalse(Arrays.asList(struct.fieldNames()).contains("a.b"));
+    assertTrue(Arrays.asList(struct.fieldNames()).contains("a"));
+    Map<String, String> config = config("collision");
+    assertFalse(config.containsKey("s.`a.b`.lance.compression"));
+    assertEquals("lz4", config.get("s.a.b.lance.compression"));
+    assertEquals("search", config.get("team"));
+  }
+
+  @Test
+  public void testDropPrimaryKeyColumnIsRejected() throws Exception {
+    createTable("pk", "id INT NOT NULL, other INT NOT NULL");
+    spark.sql("INSERT INTO " + full("pk") + " VALUES (1, 2)");
+    spark.sql("ALTER TABLE " + full("pk") + " SET UNENFORCED PRIMARY KEY (id)");
+    setProperties("pk", "'id.lance.compression' = 'zstd'");
+    Map<String, String> before = config("pk");
+    assertSqlFails(
+        () -> spark.sql("ALTER TABLE " + full("pk") + " DROP COLUMN id"), "unenforced primary key");
+    refresh("pk");
+    assertEquals(List.of("id", "other"), fieldNames("pk"));
+    assertEquals(before, config("pk"));
+    assertEquals(1, spark.sql("SELECT id FROM " + full("pk")).collectAsList().get(0).getInt(0));
+    assertSqlFails(
+        () -> spark.sql("ALTER TABLE " + full("pk") + " SET UNENFORCED PRIMARY KEY (other)"),
+        "already has unenforced primary key");
   }
 
   private void createTable(String name, String columns) {
