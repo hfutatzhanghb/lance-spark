@@ -229,18 +229,24 @@ class TestDDLTable:
         """).collect()
         assert dimension[0].value == "756"
 
-        for change in (
-            "SET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '128')",
-            "UNSET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size')",
-        ):
-            spark.sql(f"ALTER TABLE default.test_table {change}")
-            spark.sql("REFRESH TABLE default.test_table")
-            dimension = spark.sql("""
-                SHOW TBLPROPERTIES default.test_table ('embedding.arrow.fixed-size-list.size')
-            """).collect()
-            assert dimension[0].value == "756"
-            field = spark.table("default.test_table").schema["embedding"]
-            assert field.metadata["arrow.fixed-size-list.size"] == 756
+        for size in (128, 756):
+            with pytest.raises(Exception, match="can only be set at table creation"):
+                spark.sql(f"""
+                    ALTER TABLE default.test_table
+                    SET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '{size}')
+                """)
+        spark.sql("""
+            ALTER TABLE default.test_table
+            UNSET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size')
+        """)
+        spark.sql("REFRESH TABLE default.test_table")
+        dimension = spark.sql("""
+            SHOW TBLPROPERTIES default.test_table ('embedding.arrow.fixed-size-list.size')
+        """).collect()
+        assert dimension[0].value == "756"
+        assert spark.table("default.test_table").schema["embedding"].metadata[
+            "arrow.fixed-size-list.size"
+        ] == 756
 
     def test_drop_table(self, spark):
         """Test DROP TABLE."""
@@ -536,6 +542,27 @@ class TestDDLStagingTable:
 
 class TestDDLAlterTableProperties:
     """Test ALTER TABLE SET/UNSET TBLPROPERTIES operations."""
+
+    @pytest.mark.parametrize("property_key", [
+        "embedding.arrow.fixed-size-list.size", "embedding.arrow.float16",
+        "payload.arrow.fixed-size-binary.byte-width", "text.arrow.large_var_char",
+        "payload.lance.encoding", "text.lance.compression", "text.lance.compression-level",
+        "text.lance.structural-encoding", "text.lance.rle-threshold", "text.lance.bss",
+    ])
+    def test_schema_property_set_rejected_atomically(self, spark, property_key):
+        spark.sql("CREATE TABLE default.test_table (embedding ARRAY<FLOAT>, payload BINARY, text STRING)")
+        spark.sql("ALTER TABLE default.test_table SET TBLPROPERTIES ('team' = 'search')")
+        with pytest.raises(Exception, match="can only be set at table creation"):
+            spark.sql(f"""
+                ALTER TABLE default.test_table
+                SET TBLPROPERTIES ('team' = 'changed', '{property_key}' = '1')
+            """)
+        properties = {
+            row.key: row.value
+            for row in spark.sql("SHOW TBLPROPERTIES default.test_table").collect()
+        }
+        assert properties["team"] == "search"
+        assert property_key not in properties
 
     def test_set_tblproperties(self, spark):
         """SET TBLPROPERTIES stores properties visible via SHOW TBLPROPERTIES."""

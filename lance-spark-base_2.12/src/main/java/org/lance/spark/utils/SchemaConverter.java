@@ -24,6 +24,7 @@ import org.apache.spark.sql.types.StringType;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
+import java.util.List;
 import java.util.Map;
 
 import static org.lance.spark.utils.BlobUtils.ARROW_EXTENSION_BLOB_V2;
@@ -44,7 +45,32 @@ import static org.lance.spark.utils.VectorUtils.ARROW_FIXED_SIZE_LIST_SIZE_KEY;
  */
 public class SchemaConverter {
 
+  private static final List<String> SCHEMA_PROPERTY_SUFFIXES =
+      List.of(
+          VectorUtils.createVectorSizePropertyKey(""),
+          Float16Utils.createPropertyKey(""),
+          FixedSizeBinaryUtils.createPropertyKey(""),
+          LargeVarCharUtils.createPropertyKey(""),
+          BlobUtils.BLOB_ENCODING_PROPERTY_SUFFIX);
+
   private SchemaConverter() {}
+
+  /** Whether a property configures the stored Arrow schema or field encoding at creation. */
+  public static boolean isSchemaProperty(String property) {
+    for (String suffix : SCHEMA_PROPERTY_SUFFIXES) {
+      if (property.length() > suffix.length() && property.endsWith(suffix)) {
+        return true;
+      }
+    }
+    for (LanceEncodingUtils.EncodingPropertyRule rule :
+        LanceEncodingUtils.getSupportedEncodingPropertyRules()) {
+      String suffix = "." + rule.getPropertySuffix();
+      if (property.length() > suffix.length() && property.endsWith(suffix)) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   public static StructType processSchemaWithProperties(
       StructType sparkSchema, Map<String, String> properties) {

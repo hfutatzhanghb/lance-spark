@@ -13,10 +13,15 @@
  */
 package org.lance.spark;
 
+import org.lance.spark.utils.Utils;
+
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.catalog.Identifier;
+import org.apache.spark.sql.connector.catalog.TableCatalog;
+import org.apache.spark.sql.connector.catalog.TableChange;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.MetadataBuilder;
@@ -29,7 +34,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -168,21 +175,121 @@ public abstract class BaseVectorCreateTableTest {
             .collectAsList();
     assertEquals("756", dimension.get(0).getString(1));
 
-    // Config changes do not resize the vector or hide the dimension derived from its schema.
-    for (String change :
-        new String[] {
-          "SET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '128')",
-          "UNSET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size')"
-        }) {
-      spark.sql("ALTER TABLE " + fullName + " " + change);
-      spark.sql("REFRESH TABLE " + fullName);
-      List<Row> updatedDimension =
-          spark
-              .sql("SHOW TBLPROPERTIES " + fullName + " ('embedding.arrow.fixed-size-list.size')")
-              .collectAsList();
-      assertEquals("756", updatedDimension.get(0).getString(1), change);
-      assertFixedSizeListMetadata(spark.table(fullName).schema(), "embedding", 756);
+    for (String size : new String[] {"128", "756"}) {
+      UnsupportedOperationException error =
+          assertThrows(
+              UnsupportedOperationException.class,
+              () ->
+                  spark.sql(
+                      "ALTER TABLE "
+                          + fullName
+                          + " SET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '"
+                          + size
+                          + "')"));
+      assertTrue(error.getMessage().contains("can only be set at table creation"));
     }
+    spark.sql(
+        "ALTER TABLE "
+            + fullName
+            + " UNSET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size')");
+    spark.sql("REFRESH TABLE " + fullName);
+    List<Row> updatedDimension =
+        spark
+            .sql("SHOW TBLPROPERTIES " + fullName + " ('embedding.arrow.fixed-size-list.size')")
+            .collectAsList();
+    assertEquals("756", updatedDimension.get(0).getString(1));
+    assertFixedSizeListMetadata(spark.table(fullName).schema(), "embedding", 756);
+  }
+
+  @Test
+  public void testSchemaPropertySetIsRejectedAtomically() throws Exception {
+    String tableName = "protected_properties";
+    String fullName = catalogName + ".default." + tableName;
+    spark.sql(
+        "CREATE TABLE "
+            + fullName
+            + " (embedding ARRAY<FLOAT>) USING lance "
+            + "TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '756')");
+    spark.sql(
+        "ALTER TABLE "
+            + fullName
+            + " SET TBLPROPERTIES ('team' = 'search', 'custom.arrow.note' = 'keep')");
+    TableCatalog catalog =
+        (TableCatalog) spark.sessionState().catalogManager().catalog(catalogName);
+    Identifier ident = Identifier.of(new String[] {"default"}, tableName);
+    LanceDataset table = (LanceDataset) catalog.loadTable(ident);
+    Map<String, String> originalConfig;
+    long originalVersion;
+    try (var dataset = Utils.openDatasetBuilder(table.readOptions()).build()) {
+      originalConfig = dataset.getConfig();
+      originalVersion = dataset.getVersion().getId();
+    }
+    for (String property :
+        List.of(
+            "embedding.arrow.fixed-size-list.size",
+            "embedding.arrow.float16",
+            "payload.arrow.fixed-size-binary.byte-width",
+            "text.arrow.large_var_char",
+            "payload.lance.encoding",
+            "text.lance.compression",
+            "text.lance.compression-level",
+            "text.lance.structural-encoding",
+            "text.lance.rle-threshold",
+            "text.lance.bss")) {
+      UnsupportedOperationException error =
+          assertThrows(
+              UnsupportedOperationException.class,
+              () ->
+                  catalog.alterTable(
+                      ident,
+                      TableChange.setProperty("team", "changed"),
+                      TableChange.removeProperty("custom.arrow.note"),
+                      TableChange.setProperty(property, "1")));
+      assertTrue(error.getMessage().contains(property));
+    }
+    try (var dataset = Utils.openDatasetBuilder(table.readOptions()).build()) {
+      assertEquals(originalConfig, dataset.getConfig());
+      assertEquals(originalVersion, dataset.getVersion().getId());
+    }
+  }
+
+  @Test
+  public void testUnsetLegacyVectorConfigKeepsSchemaDimension() throws Exception {
+    String tableName = "legacy_vector_config";
+    String fullName = catalogName + ".default." + tableName;
+    spark.sql(
+        "CREATE TABLE "
+            + fullName
+            + " (embedding ARRAY<FLOAT>) USING lance "
+            + "TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '756')");
+    TableCatalog catalog =
+        (TableCatalog) spark.sessionState().catalogManager().catalog(catalogName);
+    LanceDataset table =
+        (LanceDataset) catalog.loadTable(Identifier.of(new String[] {"default"}, tableName));
+    // Simulate config persisted by a connector version that allowed conflicting SET operations.
+    try (var dataset = Utils.openDatasetBuilder(table.readOptions()).build()) {
+      Map<String, String> config = new HashMap<>(dataset.getConfig());
+      config.put("embedding.arrow.fixed-size-list.size", "128");
+      config.put("team", "search");
+      dataset.updateConfig(config);
+    }
+    spark.sql(
+        "ALTER TABLE "
+            + fullName
+            + " UNSET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size', 'missing.arrow.float16')");
+    spark.sql("REFRESH TABLE " + fullName);
+    try (var dataset = Utils.openDatasetBuilder(table.readOptions()).build()) {
+      assertFalse(dataset.getConfig().containsKey("embedding.arrow.fixed-size-list.size"));
+      assertEquals("search", dataset.getConfig().get("team"));
+    }
+    assertEquals(
+        "756",
+        spark
+            .sql("SHOW TBLPROPERTIES " + fullName + " ('embedding.arrow.fixed-size-list.size')")
+            .collectAsList()
+            .get(0)
+            .getString(1));
+    assertFixedSizeListMetadata(spark.table(fullName).schema(), "embedding", 756);
   }
 
   @Test

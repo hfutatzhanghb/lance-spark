@@ -34,14 +34,28 @@ Unsetting a property that does not exist is a no-op (no error is raised).
 
 ## Limitations
 
-The `enable_stable_row_ids` property controls stable row ID tracking in the Lance format and can only be set at table creation time via `TBLPROPERTIES` in `CREATE TABLE`. Changing it via `ALTER TABLE` updates the stored config value but does **not** change the actual row ID tracking behavior.
+Schema and encoding properties can only be set through `CREATE TABLE`. `ALTER TABLE ...
+SET TBLPROPERTIES` rejects these keys, including attempts to set the current value:
+
+- `<column>.arrow.fixed-size-list.size`, `<column>.arrow.float16`,
+  `<column>.arrow.fixed-size-binary.byte-width`, and `<column>.arrow.large_var_char`.
+- `<column>.lance.encoding` and the supported `<column>.lance.*` encoding keys:
+  `compression`, `compression-level`, `structural-encoding`, `rle-threshold`, and `bss`.
+
+`UNSET TBLPROPERTIES` remains available to clean up legacy config for these keys.
+It does not change the stored schema or encoding. Vector dimensions continue to appear
+in `DESCRIBE EXTENDED` and `SHOW TBLPROPERTIES`, derived from the schema.
+If a SET contains both protected and custom properties, the entire operation is rejected.
+
+The `enable_stable_row_ids` property also can only be set at table creation;
+both SET and UNSET through `ALTER TABLE` are rejected.
 
 ```sql
 -- Correct: set at creation time
 CREATE TABLE users (id BIGINT, name STRING)
     TBLPROPERTIES ('enable_stable_row_ids' = 'true');
 
--- Has no behavioral effect after creation
+-- Rejected: this property is creation-only
 ALTER TABLE users SET TBLPROPERTIES ('enable_stable_row_ids' = 'true');
 ```
 

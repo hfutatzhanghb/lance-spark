@@ -43,6 +43,7 @@ import org.lance.spark.function.LanceMultiMatchFunction;
 import org.lance.spark.function.LancePhraseFunction;
 import org.lance.spark.sharding.SparkLanceShardingUtils;
 import org.lance.spark.utils.Optional;
+import org.lance.spark.utils.SchemaConverter;
 import org.lance.spark.utils.Utils;
 import org.lance.spark.write.StagedCommit;
 import org.lance.spark.write.StagedCommitOptions;
@@ -1012,6 +1013,17 @@ public abstract class BaseLanceNamespaceSparkCatalog
       throw new UnsupportedOperationException(
           LanceSparkCatalogConfig.TABLE_OPT_ENABLE_STABLE_ROW_IDS
               + " can only be set at table creation.");
+    }
+
+    for (String property : propsToSet.keySet()) {
+      if (SchemaConverter.isSchemaProperty(property)) {
+        throw new UnsupportedOperationException(
+            "Property '"
+                + property
+                + "' can only be set at table creation. Use CREATE TABLE to configure the schema"
+                + " or encoding; UNSET TBLPROPERTIES can remove legacy config without changing"
+                + " the stored schema.");
+      }
     }
 
     if (propsToSet.isEmpty() && keysToRemove.isEmpty()) {
