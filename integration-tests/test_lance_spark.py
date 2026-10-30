@@ -229,18 +229,18 @@ class TestDDLTable:
         """).collect()
         assert dimension[0].value == "756"
 
-        for change in (
-            "SET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '128')",
-            "UNSET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size')",
-        ):
-            spark.sql(f"ALTER TABLE default.test_table {change}")
-            spark.sql("REFRESH TABLE default.test_table")
-            dimension = spark.sql("""
-                SHOW TBLPROPERTIES default.test_table ('embedding.arrow.fixed-size-list.size')
-            """).collect()
-            assert dimension[0].value == "756"
-            field = spark.table("default.test_table").schema["embedding"]
-            assert field.metadata["arrow.fixed-size-list.size"] == 756
+        spark.sql("""
+            ALTER TABLE default.test_table
+            UNSET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size')
+        """)
+        spark.sql("REFRESH TABLE default.test_table")
+        dimension = spark.sql("""
+            SHOW TBLPROPERTIES default.test_table ('embedding.arrow.fixed-size-list.size')
+        """).collect()
+        assert dimension[0].value == "756"
+        assert spark.table("default.test_table").schema["embedding"].metadata[
+            "arrow.fixed-size-list.size"
+        ] == 756
 
     def test_drop_table(self, spark):
         """Test DROP TABLE."""

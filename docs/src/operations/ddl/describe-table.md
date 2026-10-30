@@ -34,5 +34,5 @@ SHOW TBLPROPERTIES vectors ('embedding.arrow.fixed-size-list.size');
 ```
 
 Vector dimensions come from the Lance schema and take precedence over table config.
-`SET` and `UNSET TBLPROPERTIES` update config without changing the vector size or
-the dimension reported by `DESCRIBE EXTENDED` and `SHOW TBLPROPERTIES`.
+Removing a config entry with `UNSET TBLPROPERTIES` leaves the vector size and
+the dimension reported by `DESCRIBE EXTENDED` and `SHOW TBLPROPERTIES` unchanged.
