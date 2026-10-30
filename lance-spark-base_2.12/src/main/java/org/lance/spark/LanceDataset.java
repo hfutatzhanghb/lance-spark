@@ -404,9 +404,7 @@ public class LanceDataset
     // physical URI is invisible to DESCRIBE EXTENDED and to any tooling that relies on it.
     Map<String, String> props = new HashMap<>(tableProperties);
     props.put("location", readOptions.getDatasetUri());
-    // FixedSizeList dimensions live in the schema and may not be present in dataset config.
-    // Expose them as SQL properties while keeping Spark's array<float/double> column types.
-    // The actual schema takes precedence over config, including after SET/UNSET TBLPROPERTIES.
+    // Schema dimensions take precedence over stored config.
     for (StructField field : sparkSchema.fields()) {
       if (VectorUtils.shouldBeFixedSizeList(field.dataType(), field.metadata())) {
         props.put(

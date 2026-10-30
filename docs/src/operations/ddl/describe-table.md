@@ -14,9 +14,9 @@ Show detailed table information:
 DESCRIBE EXTENDED users;
 ```
 
-Fixed-size vector columns appear as `array<float>` or `array<double>` in the
-column list. `DESCRIBE EXTENDED` includes their dimensions in the `Table Properties`
-row, including when the dimensions are stored only in the Lance schema:
+Spark displays fixed-size vectors as `array<float>` or `array<double>`.
+Use `DESCRIBE EXTENDED` or `SHOW TBLPROPERTIES` to inspect their dimensions,
+including after reloading the table:
 
 ```sql
 CREATE TABLE vectors (id BIGINT, embedding ARRAY<FLOAT>)
@@ -33,9 +33,6 @@ SHOW TBLPROPERTIES vectors ('embedding.arrow.fixed-size-list.size');
 -- value: 756
 ```
 
-Dimension properties are derived from the actual Lance schema when table properties
-are read. If a stored config value disagrees with the schema, the displayed dimension
-comes from the schema. `ALTER TABLE ... SET TBLPROPERTIES` does not resize an existing
-vector column. `ALTER TABLE ... UNSET TBLPROPERTIES` removes the stored config entry,
-but the dimension still appears in `DESCRIBE EXTENDED` and `SHOW TBLPROPERTIES` because
-the column remains a fixed-size vector.
+Vector dimensions come from the Lance schema and take precedence over table config.
+`SET` and `UNSET TBLPROPERTIES` update config without changing the vector size or
+the dimension reported by `DESCRIBE EXTENDED` and `SHOW TBLPROPERTIES`.
