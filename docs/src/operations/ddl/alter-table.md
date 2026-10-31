@@ -49,7 +49,8 @@ for a blob column example.
 
 `UNSET TBLPROPERTIES` can remove legacy config without changing the stored schema or encoding.
 If a SET names any protected existing column, the entire statement is rejected.
-Concurrent column additions can also cause a commit conflict; retry the failed statement.
+Concurrent column additions can cause a commit conflict. Retry only if the columns named by
+the schema or encoding properties still do not exist; otherwise, SET is rejected.
 
 The `enable_stable_row_ids` property also can only be set at table creation;
 both SET and UNSET through `ALTER TABLE` are rejected.

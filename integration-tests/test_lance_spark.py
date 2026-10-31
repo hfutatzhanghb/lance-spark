@@ -546,7 +546,7 @@ class TestDDLAlterTableProperties:
     def test_schema_property_set_rejected_atomically(self, spark, property_key):
         spark.sql("CREATE TABLE default.test_table (embedding ARRAY<FLOAT>, payload BINARY, text STRING)")
         spark.sql("ALTER TABLE default.test_table SET TBLPROPERTIES ('team' = 'search')")
-        with pytest.raises(Exception, match="can only be set at table creation"):
+        with pytest.raises(Exception, match="Cannot set property .* because column .* already exists"):
             spark.sql(f"""
                 ALTER TABLE default.test_table
                 SET TBLPROPERTIES ('team' = 'changed', '{property_key}' = '1')
@@ -574,7 +574,7 @@ class TestDDLAlterTableProperties:
     def test_existing_and_future_schema_properties_rejected_together(self, spark):
         spark.sql("CREATE TABLE default.test_table (id INT, name STRING)")
         spark.sql("ALTER TABLE default.test_table SET TBLPROPERTIES ('team' = 'search')")
-        with pytest.raises(Exception, match="can only be set at table creation"):
+        with pytest.raises(Exception, match="Cannot set property .* because column .* already exists"):
             spark.sql("""
                 ALTER TABLE default.test_table
                 SET TBLPROPERTIES (
@@ -597,7 +597,7 @@ class TestDDLAlterTableProperties:
             CREATE TABLE default.test_table (embedding ARRAY<FLOAT>) USING lance
             TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '756')
         """)
-        with pytest.raises(Exception, match="can only be set at table creation"):
+        with pytest.raises(Exception, match="Cannot set property .* because column .* already exists"):
             spark.sql(f"""
                 ALTER TABLE default.test_table
                 SET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '{size}')
@@ -2568,7 +2568,7 @@ class TestDMLAddColumn:
         )
         assert content_type == "binary"
 
-        with pytest.raises(Exception, match="can only be set at table creation"):
+        with pytest.raises(Exception, match="Cannot set property .* because column .* already exists"):
             spark.sql(f"""
                 ALTER TABLE {test_table}
                 SET TBLPROPERTIES ('content.lance.encoding' = 'blob')

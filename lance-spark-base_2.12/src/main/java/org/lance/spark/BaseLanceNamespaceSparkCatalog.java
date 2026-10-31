@@ -1061,14 +1061,13 @@ public abstract class BaseLanceNamespaceSparkCatalog
       String column = SchemaConverter.schemaPropertyColumn(property);
       if (column != null && existingColumns.contains(column)) {
         throw new UnsupportedOperationException(
-            "Property '"
+            "Cannot set property '"
                 + property
-                + "' can only be set at table creation because column '"
+                + "' because column '"
                 + column
-                + "' already exists. Configure that column with CREATE TABLE."
-                + " A property for a column that is not in the schema yet can still be set"
-                + " before ADD COLUMNS. UNSET TBLPROPERTIES can remove legacy config without"
-                + " changing the stored schema.");
+                + "' already exists. Schema and encoding properties must be configured before"
+                + " the column exists. UNSET TBLPROPERTIES removes config without changing"
+                + " the stored schema.");
       }
     }
   }

@@ -622,7 +622,12 @@ public abstract class BaseVectorCreateTableTest {
                           + " SET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '"
                           + size
                           + "')"));
-      assertTrue(error.getMessage().contains("can only be set at table creation"));
+      assertTrue(
+          error
+              .getMessage()
+              .contains(
+                  "Cannot set property 'embedding.arrow.fixed-size-list.size'"
+                      + " because column 'embedding' already exists."));
     }
     assertFixedSizeListMetadata(spark.table(fullName).schema(), "embedding", 756);
   }
