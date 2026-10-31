@@ -34,25 +34,22 @@ Unsetting a property that does not exist is a no-op (no error is raised).
 
 ## Limitations
 
-Schema and encoding properties for a column already in the table can only be set through
-`CREATE TABLE`. `ALTER TABLE ... SET TBLPROPERTIES` rejects those keys, including attempts
-to set the current value:
+Schema and encoding properties must be configured before the column exists: in `CREATE TABLE`
+for initial columns, or with `SET TBLPROPERTIES` before `ADD COLUMNS` for future columns.
+Once the column exists, SET rejects these keys, even when setting the current value:
 
 - `<column>.arrow.fixed-size-list.size`, `<column>.arrow.float16`,
   `<column>.arrow.fixed-size-binary.byte-width`, and `<column>.arrow.large_var_char`.
 - `<column>.lance.encoding` and the supported `<column>.lance.*` encoding keys:
   `compression`, `compression-level`, `structural-encoding`, `rle-threshold`, and `bss`.
 
-The same keys are accepted when the named column is not in the schema yet. Directory-backed
-tables do not persist `CREATE TABLE` user properties, so set the future-column property with
-`ALTER TABLE` before `ADD COLUMNS`. For example, set `content.lance.encoding` to `blob` before
-adding a blob column. See [ADD COLUMNS](../dml/add-columns.md).
+For directory-backed tables, use `ALTER TABLE` to persist future-column properties because
+`CREATE TABLE` does not persist user properties. See [ADD COLUMNS](../dml/add-columns.md)
+for a blob column example.
 
-`UNSET TBLPROPERTIES` remains available to clean up legacy config for these keys.
-It does not change the stored schema or encoding. Vector dimensions continue to appear
-in `DESCRIBE EXTENDED` and `SHOW TBLPROPERTIES`, derived from the schema.
-If a SET names any protected existing column, the entire operation is rejected and no
-property from that statement is written.
+`UNSET TBLPROPERTIES` can remove legacy config without changing the stored schema or encoding.
+If a SET names any protected existing column, the entire statement is rejected.
+Concurrent column additions can also cause a commit conflict; retry the failed statement.
 
 The `enable_stable_row_ids` property also can only be set at table creation;
 both SET and UNSET through `ALTER TABLE` are rejected.

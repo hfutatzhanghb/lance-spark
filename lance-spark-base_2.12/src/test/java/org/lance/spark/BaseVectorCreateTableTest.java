@@ -13,8 +13,17 @@
  */
 package org.lance.spark;
 
+import org.lance.CommitBuilder;
+import org.lance.Transaction;
+import org.lance.operation.Merge;
+import org.lance.operation.UpdateConfig;
+import org.lance.operation.UpdateMap;
 import org.lance.spark.utils.Utils;
 
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
@@ -37,6 +46,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 
 import static org.apache.spark.sql.connector.catalog.TableChange.removeProperty;
 import static org.apache.spark.sql.connector.catalog.TableChange.setProperty;
@@ -617,6 +627,102 @@ public abstract class BaseVectorCreateTableTest {
     try (var dataset = Utils.openDatasetBuilder(table.readOptions()).build()) {
       assertEquals("blob", dataset.getConfig().get("content.lance.encoding"));
       assertEquals("search", dataset.getConfig().get("team"));
+    }
+  }
+
+  @Test
+  public void testConcurrentColumnAdditionRejectsStaleEncodingConfig() throws Exception {
+    String tableName = "concurrent_blob_encoding";
+    String fullName = catalogName + ".default." + tableName;
+    spark.sql("CREATE TABLE " + fullName + " (id INT) USING lance");
+    spark.sql("ALTER TABLE " + fullName + " SET TBLPROPERTIES ('team' = 'search')");
+    BaseLanceNamespaceSparkCatalog catalog =
+        (BaseLanceNamespaceSparkCatalog) spark.sessionState().catalogManager().catalog(catalogName);
+    Identifier ident = Identifier.of(new String[] {"default"}, tableName);
+    LanceDataset table = (LanceDataset) catalog.loadTable(ident);
+    try (var stale = Utils.openDatasetBuilder(table.readOptions()).build();
+        var concurrent = Utils.openDatasetBuilder(table.readOptions()).build()) {
+      assertFalse(
+          stale.getSchema().getFields().stream().anyMatch(f -> f.getName().equals("content")));
+      concurrent.addColumns(
+          List.of(new Field("content", FieldType.nullable(new ArrowType.Binary()), null)));
+      long concurrentVersion = concurrent.version();
+      assertThrows(
+          RuntimeException.class,
+          () ->
+              catalog.alterTableProperties(
+                  stale,
+                  Map.of("content.lance.encoding", "blob", "other", "value"),
+                  Set.of("team"),
+                  false,
+                  List.of("default", tableName)));
+      try (var latest = Utils.openDatasetBuilder(table.readOptions()).build()) {
+        assertEquals(concurrentVersion, latest.version());
+        assertEquals(Map.of("team", "search"), latest.getConfig());
+        assertEquals(new ArrowType.Binary(), latest.getSchema().findField("content").getType());
+      }
+    }
+    assertThrows(
+        UnsupportedOperationException.class,
+        () -> catalog.alterTable(ident, setProperty("content.lance.encoding", "blob")));
+  }
+
+  @Test
+  public void testEncodingConfigRejectsStaleColumnAddition() throws Exception {
+    String tableName = "stale_blob_column";
+    String fullName = catalogName + ".default." + tableName;
+    spark.sql("CREATE TABLE " + fullName + " (id INT) USING lance");
+    TableCatalog catalog =
+        (TableCatalog) spark.sessionState().catalogManager().catalog(catalogName);
+    LanceDataset table =
+        (LanceDataset) catalog.loadTable(Identifier.of(new String[] {"default"}, tableName));
+    Map<String, String> schemaMetadata = Map.of("owner", "search");
+    try (var dataset = Utils.openDatasetBuilder(table.readOptions()).build();
+        Transaction txn =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(
+                    UpdateConfig.builder()
+                        .schemaMetadataUpdates(
+                            UpdateMap.builder().updates(schemaMetadata).replace(true).build())
+                        .build())
+                .build();
+        var committed = new CommitBuilder(dataset).execute(txn)) {
+      assertEquals(schemaMetadata, committed.getSchema().getCustomMetadata());
+    }
+    try (var stale = Utils.openDatasetBuilder(table.readOptions()).build()) {
+      List<Field> fields = new ArrayList<>(stale.getSchema().getFields());
+      fields.add(new Field("content", FieldType.nullable(new ArrowType.Binary()), null));
+      try (Transaction txn =
+          new Transaction.Builder()
+              .readVersion(stale.version())
+              .operation(
+                  Merge.builder()
+                      .fragments(List.of())
+                      .schema(new Schema(fields, schemaMetadata))
+                      .build())
+              .build()) {
+        spark.sql(
+            "ALTER TABLE " + fullName + " SET TBLPROPERTIES ('content.lance.encoding' = 'blob')");
+        long configVersion;
+        try (var latest = Utils.openDatasetBuilder(table.readOptions()).build()) {
+          configVersion = latest.version();
+          assertEquals(schemaMetadata, latest.getSchema().getCustomMetadata());
+        }
+        assertThrows(
+            RuntimeException.class,
+            () -> {
+              try (var ignored = new CommitBuilder(stale).execute(txn)) {
+                fail("A stale ADD COLUMNS must not commit over the encoding configuration");
+              }
+            });
+        try (var latest = Utils.openDatasetBuilder(table.readOptions()).build()) {
+          assertEquals(configVersion, latest.version());
+          assertEquals("blob", latest.getConfig().get("content.lance.encoding"));
+          assertEquals(1, latest.getSchema().getFields().size());
+          assertEquals(schemaMetadata, latest.getSchema().getCustomMetadata());
+        }
+      }
     }
   }
 
