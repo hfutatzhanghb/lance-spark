@@ -149,6 +149,75 @@ public abstract class BaseVectorCreateTableTest {
   }
 
   @Test
+  public void testDescribeExtendedShowsVectorDimensions() throws Exception {
+    String fullName = catalogName + ".default.vector_describe_table";
+    spark.sql(
+        "CREATE TABLE "
+            + fullName
+            + " (embedding ARRAY<FLOAT>, embedding_double ARRAY<DOUBLE>, values ARRAY<FLOAT>)"
+            + " USING lance TBLPROPERTIES ("
+            + "'embedding.arrow.fixed-size-list.size' = '756', "
+            + "'embedding_double.arrow.fixed-size-list.size' = '64')");
+
+    // Reload from disk: dimensions must come from the schema, not CREATE TABLE's options.
+    spark.sql("REFRESH TABLE " + fullName);
+    spark.sql("ALTER TABLE " + fullName + " SET TBLPROPERTIES ('team' = 'search')");
+    List<Row> description = spark.sql("DESCRIBE EXTENDED " + fullName).collectAsList();
+    Row embedding =
+        description.stream()
+            .filter(row -> "embedding".equals(row.getString(0)))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("Missing embedding column"));
+    assertEquals("array<float>", embedding.getString(1));
+    String properties =
+        description.stream()
+            .filter(row -> "Table Properties".equals(row.getString(0)))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("Missing Table Properties row"))
+            .getString(1);
+    assertTrue(properties.contains("embedding.arrow.fixed-size-list.size=756"));
+    assertTrue(properties.contains("embedding_double.arrow.fixed-size-list.size=64"));
+    assertTrue(properties.contains("team=search"));
+    assertFalse(properties.contains("values.arrow.fixed-size-list.size"));
+
+    List<Row> dimension =
+        spark
+            .sql("SHOW TBLPROPERTIES " + fullName + " ('embedding.arrow.fixed-size-list.size')")
+            .collectAsList();
+    assertEquals("756", dimension.get(0).getString(1));
+
+    TableCatalog catalog =
+        (TableCatalog) spark.sessionState().catalogManager().catalog(catalogName);
+    LanceDataset table =
+        (LanceDataset)
+            catalog.loadTable(Identifier.of(new String[] {"default"}, "vector_describe_table"));
+    // Model legacy config independently of the catalog's ALTER TABLE mutation policy.
+    try (var dataset = Utils.openDatasetBuilder(table.readOptions()).build()) {
+      Map<String, String> config = new HashMap<>(dataset.getConfig());
+      config.put("embedding.arrow.fixed-size-list.size", "128");
+      dataset.updateConfig(config);
+    }
+    spark.sql("REFRESH TABLE " + fullName);
+    List<Row> conflictingDimension =
+        spark
+            .sql("SHOW TBLPROPERTIES " + fullName + " ('embedding.arrow.fixed-size-list.size')")
+            .collectAsList();
+    assertEquals("756", conflictingDimension.get(0).getString(1));
+
+    spark.sql(
+        "ALTER TABLE "
+            + fullName
+            + " UNSET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size')");
+    spark.sql("REFRESH TABLE " + fullName);
+    List<Row> updatedDimension =
+        spark
+            .sql("SHOW TBLPROPERTIES " + fullName + " ('embedding.arrow.fixed-size-list.size')")
+            .collectAsList();
+    assertEquals("756", updatedDimension.get(0).getString(1));
+    assertFixedSizeListMetadata(spark.table(fullName).schema(), "embedding", 756);
+  }
+
+  @Test
   public void testCreateTableWithVectorColumnFloat32() {
     String tableName = "vector_table_float32_" + System.currentTimeMillis();
 
